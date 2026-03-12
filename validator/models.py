@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass, field
 from datetime import datetime
 import threading
@@ -32,8 +33,8 @@ class DataVariable:
     id: int
     short_name: str
     pretty_name: str
-    unit: str = "n.a."
     help_text: str
+    unit: str = "n.a."
 
     min_value: Optional[float] = None
     max_value: Optional[float] = None
@@ -76,8 +77,8 @@ class DatasetVersion:
     time_range_start: Optional[str] = None
     time_range_end: Optional[str] = None
     geographical_range: Optional[dict] = None
-    filters: list = []
-    variables: list = []
+    filters: list = field(default_factory=list)
+    variables: list = field(default_factory=list)
 
     def __str__(self):
         return self.short_name
@@ -89,20 +90,19 @@ class Dataset:
     short_name: str
     pretty_name: str
     help_text: str
-
-    storage_path: str = ""
-
     detailed_description: str
     source_reference: str
     citation: str
 
+    storage_path: str = ""
+
     is_spatial_reference: bool = False
     is_scattered_data: bool = False
 
-    versions: list = []
+    versions: list = field(default_factory=list)
 
     resolution = None
-
+    reader: Optional[str] = None
     # many-to-one relationships coming from other models:
     # dataset_configuration from DatasetConfiguration
 

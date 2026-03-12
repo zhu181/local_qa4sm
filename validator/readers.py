@@ -1,5 +1,6 @@
 import logging
-from os import path
+from os import listdir, path
+from netCDF4 import Dataset as NetCDFDataset
 
 # from ascat.read_native.cdr import AscatGriddedNcTs
 # from c3s_sm.interface import C3STs
@@ -25,7 +26,34 @@ from validator import globals
 from pytesmo.validation_framework.adapters import TimestampAdapter
 import pandas as pd
 
+from validator.models import Dataset
+
 __logger = logging.getLogger(__name__)
+
+
+def _uses_indexed_ragged_format(ts_path: str) -> bool:
+    try:
+        netcdf_files = sorted(
+            filename
+            for filename in listdir(ts_path)
+            if filename.endswith('.nc') and filename != 'grid.nc'
+        )
+        if not netcdf_files:
+            return False
+
+        sample_file = path.join(ts_path, netcdf_files[0])
+        with NetCDFDataset(sample_file, 'r') as ds:
+            if 'locationIndex' not in ds.variables:
+                return False
+            soil_moisture = ds.variables.get('soil_moisture')
+            if soil_moisture is None:
+                return True
+            return len(soil_moisture.dimensions) == 1
+    except Exception as exc:
+        __logger.warning(
+            'Failed to inspect SMAP file structure in %s: %s', ts_path, exc
+        )
+        return False
 
 
 class ReaderWithTsExtension:
@@ -126,29 +154,41 @@ class SMOSL2Reader(GriddedNcIndexedRaggedTs):
         return ts
 
 
-def create_reader(dataset, version) -> GriddedNcTs:
+def create_reader(dataset:Dataset, version) -> GriddedNcTs:
     """
     Create basic readers (without any adapters / filters) for a dataset version
     """
 
     reader = None  # reader class, inherits pynetcf time series module
 
-    folder_name = path.join(dataset.storage_path, version.short_name)
-    ext_folder_name = path.join(
-        dataset.storage_path, version.short_name + "-ext", "timeseries"
-    )
+    # folder_name = path.join(dataset.storage_path, version.short_name)
+    # ext_folder_name = path.join(
+    #     dataset.storage_path, version.short_name + "-ext", "timeseries"
+    # )
 
-    if dataset.short_name == globals.ISMN:
-        if path.isfile(path.join(folder_name, "frm_classification.csv")):
+    # if dataset.short_name == globals.ISMN:
+    #     if path.isfile(path.join(folder_name, "frm_classification.csv")):
+    #         custom_meta_readers = [
+    #             CustomSensorMetadataCsv(
+    #                 path.join(folder_name, "frm_classification.csv"),
+    #                 fill_values={"frm_class": "undeducible"},
+    #             ),
+    #         ]
+    #     else:
+    #         custom_meta_readers = None
+    #     reader = ISMN_Interface(folder_name, custom_meta_reader=custom_meta_readers)
+    
+    if dataset.reader == "ISMN_Interface":
+        if path.isfile(path.join(dataset.storage_path, "frm_classification.csv")):
             custom_meta_readers = [
                 CustomSensorMetadataCsv(
-                    path.join(folder_name, "frm_classification.csv"),
+                    path.join(dataset.storage_path, "frm_classification.csv"),
                     fill_values={"frm_class": "undeducible"},
                 ),
             ]
         else:
             custom_meta_readers = None
-        reader = ISMN_Interface(folder_name, custom_meta_reader=custom_meta_readers)
+        reader = ISMN_Interface(dataset.storage_path, custom_meta_reader=custom_meta_readers)
 
     # if dataset.short_name == globals.C3SC:
     #     c3s_data_folder = path.join(
@@ -190,9 +230,23 @@ def create_reader(dataset, version) -> GriddedNcTs:
     # if dataset.short_name == globals.GLDAS:
     #     reader = GLDASTs(folder_name, ioclass_kws={"read_bulk": True})
 
-    if dataset.short_name == globals.SMAP_L3 and version.short_name != "SMAP_V9_AM_PM":
-        smap_data_folder = path.join(folder_name, "netcdf")
-        reader = SMAPTs(smap_data_folder, ioclass_kws={"read_bulk": True})
+    # if dataset.short_name == globals.SMAP_L3 and version.short_name != "SMAP_V9_AM_PM":
+    #     smap_data_folder = path.join(folder_name, "netcdf")
+    #     reader = SMAPTs(smap_data_folder, ioclass_kws={"read_bulk": True})
+    if dataset.reader == "SMAPTs":
+        if _uses_indexed_ragged_format(dataset.storage_path):
+            __logger.warning(
+                "Dataset %s configured as SMAPTs but files are indexed ragged; falling back to SMAPL3_V9Reader.",
+                dataset.short_name,
+            )
+            reader = SMAPL3_V9Reader(
+                dataset.storage_path, ioclass_kws={"read_bulk": True}
+            )
+        else:
+            reader = SMAPTs(dataset.storage_path, ioclass_kws={"read_bulk": True})
+
+    if dataset.reader == "SMAPL3_V9Reader":
+        reader = SMAPL3_V9Reader(dataset.storage_path, ioclass_kws={"read_bulk": True})
 
     # if dataset.short_name == globals.ASCAT:
     #     ascat_data_folder = path.join(folder_name, "data")
@@ -219,49 +273,50 @@ def create_reader(dataset, version) -> GriddedNcTs:
     #         ERATs, folder_name, ext_folder_name, ioclass_kws={"read_bulk": True}
     #     )
 
-    if dataset.short_name == globals.CGLS_SCATSAR_SWI1km:
-        reader = S1CglsTs(folder_name)
+    # if dataset.short_name == globals.CGLS_SCATSAR_SWI1km:
+    #     reader = S1CglsTs(dataset.storage_path)
 
-    if dataset.short_name == globals.CGLS_CSAR_SSM1km:
-        reader = S1CglsTs(folder_name)
+    # if dataset.short_name == globals.CGLS_CSAR_SSM1km:
+    #     reader = S1CglsTs(dataset.storage_path)
+
 
     # if dataset.short_name == globals.SMOS_L3:
     #     reader = SMOSTs(folder_name, ioclass_kws={"read_bulk": True})
 
-    if dataset.short_name == globals.SMOS_L2:
-        reader = ReaderWithTsExtension(
-            SMOSL2Reader,
-            folder_name,
-            ext_folder_name,
-            ioclass_kws={"read_bulk": True},
-            grid=load_grid(path.join(folder_name, "grid.nc")),
-        )
+    # if dataset.short_name == globals.SMOS_L2:
+    #     reader = ReaderWithTsExtension(
+    #         SMOSL2Reader,
+    #         folder_name,
+    #         ext_folder_name,
+    #         ioclass_kws={"read_bulk": True},
+    #         grid=load_grid(path.join(folder_name, "grid.nc")),
+    #     )
 
-    if dataset.short_name == globals.SMAP_L2:
-        reader = GriddedNcOrthoMultiTs(folder_name, ioclass_kws={"read_bulk": True})
+    # if dataset.short_name == globals.SMAP_L2:
+    #     reader = GriddedNcOrthoMultiTs(folder_name, ioclass_kws={"read_bulk": True})
 
-    if dataset.short_name == globals.SMAP_L3 and version.short_name == "SMAP_V9_AM_PM":
-        smap_data_folder = path.join(folder_name, "netcdf")
-        smap_ext_folder_name = path.join(f"{folder_name}-ext", "timeseries")
-        reader = ReaderWithExtension_SMAP(
-            SMAPL3_V9Reader,
-            smap_data_folder,
-            smap_ext_folder_name,
-            ioclass_kws={"read_bulk": True},
-            grid=load_grid(path.join(smap_data_folder, "grid.nc")),
-        )
+    # if dataset.short_name == globals.SMAP_L3 and version.short_name == "SMAP_V9_AM_PM":
+    #     smap_data_folder = path.join(folder_name, "netcdf")
+    #     smap_ext_folder_name = path.join(f"{folder_name}-ext", "timeseries")
+    #     reader = ReaderWithExtension_SMAP(
+    #         SMAPL3_V9Reader,
+    #         smap_data_folder,
+    #         smap_ext_folder_name,
+    #         ioclass_kws={"read_bulk": True},
+    #         grid=load_grid(path.join(smap_data_folder, "grid.nc")),
+    #     )
 
-    if dataset.short_name == globals.SMOS_SBPCA:
-        if version.short_name == globals.SMOS_SBPCA_v724:
-            reader = SBPCAReader(folder_name, ioclass_kws={"read_bulk": True})
-        elif version.short_name == globals.V781_FinalMetrics:
-            reader = SMOSL2Reader(
-                folder_name,
-                grid=load_grid(path.join(folder_name, "grid.nc")),
-                ioclass_kws={"read_bulk": True},
-            )
-        else:
-            raise NotImplementedError("Unknown version of SMOS_DPGS_RC_L2SM")
+    # if dataset.short_name == globals.SMOS_SBPCA:
+    #     if version.short_name == globals.SMOS_SBPCA_v724:
+    #         reader = SBPCAReader(folder_name, ioclass_kws={"read_bulk": True})
+    #     elif version.short_name == globals.V781_FinalMetrics:
+    #         reader = SMOSL2Reader(
+    #             folder_name,
+    #             grid=load_grid(path.join(folder_name, "grid.nc")),
+    #             ioclass_kws={"read_bulk": True},
+    #         )
+    #     else:
+    #         raise NotImplementedError("Unknown version of SMOS_DPGS_RC_L2SM")
 
     # if dataset.user and len(dataset.user_dataset.all()):
     #     file = UserDatasetFile.objects.get(dataset=dataset)
@@ -273,6 +328,12 @@ def create_reader(dataset, version) -> GriddedNcTs:
     #         reader = GriddedNcContiguousRaggedTs(
     #             file.get_raw_file_path + "/timeseries", ioclass_kws={"read_bulk": True}
     #         )
+
+    if dataset.reader == "GriddedNcOrthoMultiTs":
+        reader = GriddedNcOrthoMultiTs(dataset.storage_path, ioclass_kws={"read_bulk": True})
+    
+    if dataset.reader == "GriddedNcContiguousRaggedTs":
+        reader = GriddedNcContiguousRaggedTs(dataset.storage_path, ioclass_kws={"read_bulk": True})
 
     if not reader:
         raise ValueError("Reader for dataset '{}' not available".format(dataset))
