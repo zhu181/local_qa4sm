@@ -1,0 +1,20 @@
+[project]
+name = "local-qa4sm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ismn>=1.5.2",
+    "numpy>=2.4.3",
+    "pandas>=3.0.1",
+    "pygeobase>=0.6.3",
+    "pygeogrids>=0.5.3",
+    "pynetcf>=0.5.2",
+    "pytesmo>=0.18.0",
+    "pytz>=2026.1.post1",
+    "rioxarray>=0.22.0",
+    "scipy>=1.17.1",
+    "smap-io>=0.8",
+    "xarray>=2026.2.0"
+]
