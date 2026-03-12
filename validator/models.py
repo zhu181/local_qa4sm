@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 import threading
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Union
 
 
 @dataclass
@@ -176,7 +176,7 @@ class ValidationRun:
     # temporal matching window size:
     TEMP_MATCH_WINDOW = 12
 
-    id: int
+    id: Union[str, int]
     name_tag: str
     total_points: int = 0
     error_points: int = 0

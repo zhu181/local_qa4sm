@@ -6,7 +6,6 @@ import logging
 from ismn.interface import ISMN_Interface
 from pygeobase.io_base import GriddedBase
 
-from validator.models import DataFilter
 from validator import globals
 from validator.readers import ReaderWithTsExtension
 from smap_io.interface import ReaderWithExtension_SMAP
@@ -16,8 +15,8 @@ __logger = logging.getLogger(__name__)
 
 # function to retrieve depth_from and depth_to from the database
 def get_depths_params(param_filters):
-    default_depth = DataFilter.objects.get(name="FIL_ISMN_DEPTH").default_parameter
-    default_depth = [float(depth) for depth in default_depth.split(",")]
+
+    default_depth = [0.0, 2.0]  # default depth range if no parameterised filter is set
     depth_from = default_depth[0]
     depth_to = default_depth[1]
 
@@ -188,13 +187,29 @@ def create_jobs(
         depth_from, depth_to = get_depths_params(dataset_config.parametrisedfilter_set)
         filter_meta_dict = get_meta_filter_dict(list(dataset_config.filters))
 
-        ids = reader.get_dataset_ids(
-            variable=dataset_config.variable.short_name,
-            min_depth=depth_from,
-            max_depth=depth_to,
-            filter_meta_dict=filter_meta_dict,
-            groupby="network",
-        )
+        try:
+            ids = reader.get_dataset_ids(
+                variable=dataset_config.variable.short_name,
+                min_depth=depth_from,
+                max_depth=depth_to,
+                filter_meta_dict=filter_meta_dict,
+                groupby="network",
+            )
+        except KeyError as exc:
+            if filter_meta_dict and "frm_class" in filter_meta_dict and "frm_class" in str(exc):
+                __logger.warning(
+                    "FRM metadata field 'frm_class' is missing in ISMN metadata. "
+                    "Continuing without FIL_ISMN_FRM_representative filtering."
+                )
+                ids = reader.get_dataset_ids(
+                    variable=dataset_config.variable.short_name,
+                    min_depth=depth_from,
+                    max_depth=depth_to,
+                    filter_meta_dict=None,
+                    groupby="network",
+                )
+            else:
+                raise
 
         def reshape_meta(metadata):
             # reshape metadata dictionary to facilitate use

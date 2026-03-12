@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from types import MethodType
 from typing import Any, Optional
+from uuid import uuid4
 
 
 class Collection(list):
@@ -50,19 +51,21 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
 	raise ValueError(f"Unsupported datetime value: {value!r}")
 
 
-def _parse_filter(payload: dict[str, Any]) -> DataFilter:
+def _parse_filter(payload: Any) -> DataFilter:
+	# Compact syntax is supported: "FIL_ISMN_GOOD"
+	if isinstance(payload, str):
+		name = payload
+		return DataFilter(id=0, name=name, description=name, help_text="")
+
+	if not isinstance(payload, dict):
+		raise ValueError(f"Unsupported filter definition: {payload!r}")
+
+	name = payload["name"]
 	return DataFilter(
 		id=payload.get("id", 0),
-		name=payload["name"],
-		description=payload.get("description", payload["name"]),
+		name=name,
+		description=payload.get("description", name),
 		help_text=payload.get("help_text", ""),
-		parameterised=payload.get("parameterised", False),
-		dialog_name=payload.get("dialog_name"),
-		default_set_active=payload.get("default_set_active", False),
-		default_parameter=payload.get("default_parameter"),
-		to_include=payload.get("to_include"),
-		to_exclude=payload.get("to_exclude"),
-		readonly=payload.get("readonly", False),
 	)
 
 
@@ -114,7 +117,7 @@ def _parse_dataset_configuration(payload: dict[str, Any], validation: Validation
 	filters = Collection(_parse_filter(item) for item in payload.get("filters", []))
 	parametrised_filters = Collection(
 		ParametrizedFilter(
-			filter=_parse_filter(item["filter"]),
+			filter=_parse_filter(item.get("filter", item.get("name"))),
 			parameters=item.get("parameters", ""),
 		)
 		for item in payload.get("parametrised_filters", [])
@@ -153,10 +156,12 @@ def _resolve_config_ref(
 
 def parse_validation_run_config(payload: dict[str, Any]) -> ValidationRun:
 	raw = payload.get("validation_run", payload)
+	runtime_run_id = str(uuid4())
+	config_run_id = raw.get("id")
 
 	val_run = ValidationRun(
-		id=raw["id"],
-		name_tag=raw.get("name_tag", f"validation-{raw['id']}"),
+		id=runtime_run_id,
+		name_tag=raw.get("name_tag", f"validation-{runtime_run_id}"),
 		total_points=raw.get("total_points", 0),
 		error_points=raw.get("error_points", 0),
 		ok_points=raw.get("ok_points", 0),
@@ -216,6 +221,7 @@ def parse_validation_run_config(payload: dict[str, Any]) -> ValidationRun:
 		return None
 
 	val_run.save = MethodType(_save, val_run)
+	val_run.config_id = config_run_id
 	return val_run
 
 

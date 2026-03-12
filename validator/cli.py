@@ -1,15 +1,97 @@
 import argparse
 import json
 import logging
+import warnings
 from pathlib import Path
 
 from validator.orchestrator import (
 	parse_validation_run_config,
-	run_validation_from_json_file,
 )
 
 
 LOGGER = logging.getLogger(__name__)
+_ORIGINAL_SHOWWARNING = warnings.showwarning
+
+
+def _install_warning_suppression() -> None:
+	def _showwarning(message, category, filename, lineno, file=None, line=None):
+		msg = str(message)
+		if (
+			"Not enough observations to calculate metrics." in msg
+			or "One or more sample arguments is too small; all returned values will be NaN." in msg
+			or "An input array is constant; the correlation coefficient is not defined." in msg
+			or "No data for dataset" in msg
+		):
+			return
+		return _ORIGINAL_SHOWWARNING(
+			message, category, filename, lineno, file=file, line=line
+		)
+
+	warnings.showwarning = _showwarning
+
+
+class _ValidationNoiseFilter(logging.Filter):
+	"""Suppress highly repetitive non-fatal records while keeping first samples."""
+
+	def __init__(self, keep_first: int = 5):
+		super().__init__()
+		self.keep_first = keep_first
+		self._counts = {
+			"no_data_for_gpi": 0,
+			"no_temporal_match": 0,
+			"warn_not_enough_obs": 0,
+			"warn_small_sample": 0,
+			"warn_constant_input": 0,
+			"warn_no_data_dataset": 0,
+		}
+
+	def filter(self, record: logging.LogRecord) -> bool:
+		msg = record.getMessage()
+		if "No data for gpi" in msg:
+			self._counts["no_data_for_gpi"] += 1
+			return self._counts["no_data_for_gpi"] <= self.keep_first
+		if "No temporally matched data" in msg:
+			self._counts["no_temporal_match"] += 1
+			return self._counts["no_temporal_match"] <= self.keep_first
+		if "Not enough observations to calculate metrics." in msg:
+			self._counts["warn_not_enough_obs"] += 1
+			return self._counts["warn_not_enough_obs"] <= self.keep_first
+		if "SmallSampleWarning" in msg:
+			self._counts["warn_small_sample"] += 1
+			return self._counts["warn_small_sample"] <= self.keep_first
+		if "ConstantInputWarning" in msg:
+			self._counts["warn_constant_input"] += 1
+			return self._counts["warn_constant_input"] <= self.keep_first
+		if "No data for dataset" in msg:
+			self._counts["warn_no_data_dataset"] += 1
+			return self._counts["warn_no_data_dataset"] <= self.keep_first
+		return True
+
+	def emit_summary(self) -> None:
+		suppressed_gpi = max(0, self._counts["no_data_for_gpi"] - self.keep_first)
+		suppressed_temporal = max(
+			0, self._counts["no_temporal_match"] - self.keep_first
+		)
+		if suppressed_gpi > 0:
+			LOGGER.info(
+				"Suppressed %s repetitive 'No data for gpi' records.",
+				suppressed_gpi,
+			)
+		if suppressed_temporal > 0:
+			LOGGER.info(
+				"Suppressed %s repetitive 'No temporally matched data' records.",
+				suppressed_temporal,
+			)
+
+		for key, label in [
+			("warn_not_enough_obs", "Not enough observations warnings"),
+			("warn_small_sample", "Small sample warnings"),
+			("warn_constant_input", "Constant input warnings"),
+			("warn_no_data_dataset", "No data for dataset warnings"),
+		]:
+			suppressed = max(0, self._counts[key] - self.keep_first)
+			if suppressed > 0:
+				LOGGER.info("Suppressed %s repetitive %s.", suppressed, label)
 
 
 def _default_config_path() -> Path:
@@ -51,19 +133,25 @@ def _build_parser() -> argparse.ArgumentParser:
 	return parser
 
 
-def _configure_logging(log_level: str, log_file: str | None = None) -> None:
+def _configure_logging(log_level: str, log_file: str | None = None) -> _ValidationNoiseFilter:
 	level = getattr(logging, log_level.upper(), logging.INFO)
 	formatter = logging.Formatter(
 		"%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 	)
+	noise_filter = _ValidationNoiseFilter()
 
 	root_logger = logging.getLogger()
 	root_logger.setLevel(level)
 	root_logger.handlers.clear()
+	root_logger.filters.clear()
+	root_logger.addFilter(noise_filter)
+	logging.captureWarnings(True)
+	_install_warning_suppression()
 
 	console_handler = logging.StreamHandler()
 	console_handler.setLevel(level)
 	console_handler.setFormatter(formatter)
+	console_handler.addFilter(noise_filter)
 	root_logger.addHandler(console_handler)
 
 	if log_file:
@@ -72,7 +160,13 @@ def _configure_logging(log_level: str, log_file: str | None = None) -> None:
 		file_handler = logging.FileHandler(log_path, encoding="utf-8")
 		file_handler.setLevel(level)
 		file_handler.setFormatter(formatter)
+		file_handler.addFilter(noise_filter)
 		root_logger.addHandler(file_handler)
+
+	# Keep warnings enabled, but limit duplicates via logging filter above.
+	warnings.simplefilter("default")
+
+	return noise_filter
 
 
 def _print_dry_run_summary(config_path: Path) -> int:
@@ -131,7 +225,7 @@ def _validate_dataset_inputs(val_run) -> None:
 def main(argv: list[str] | None = None) -> int:
 	parser = _build_parser()
 	args = parser.parse_args(argv)
-	_configure_logging(args.log_level, args.log_file)
+	noise_filter = _configure_logging(args.log_level, args.log_file)
 
 	config_path = Path(args.config)
 	if not config_path.exists():
@@ -159,10 +253,13 @@ def main(argv: list[str] | None = None) -> int:
 		_validate_dataset_inputs(val_run)
 
 		LOGGER.info("Starting validation run from %s", config_path)
-		result = run_validation_from_json_file(config_path)
+		from validator.validation import run_validation
+
+		result = run_validation(val_run)
 		LOGGER.info(
-			"Validation finished. id=%s total=%s ok=%s error=%s",
+			"Validation finished. id=%s config_id=%s total=%s ok=%s error=%s",
 			result.id,
+			getattr(result, "config_id", "N/A"),
 			result.total_points,
 			result.ok_points,
 			result.error_points,
@@ -171,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
 	except Exception:
 		LOGGER.exception("Validation CLI failed")
 		return 1
+	finally:
+		noise_filter.emit_summary()
 
 
 if __name__ == "__main__":

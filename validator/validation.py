@@ -4,7 +4,6 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import logging
 import os
 import time
-from re import sub as regex_sub
 import uuid
 import ast
 
@@ -34,6 +33,7 @@ from pytesmo.validation_framework.metric_calculators_adapters import (
 
 from pytz import UTC
 import pytz
+from ismn.interface import ISMN_Interface
 from validator.models import ValidationTask
 from validator.models import ValidationRun
 from validator.batches import create_jobs, create_upscaling_lut
@@ -124,8 +124,21 @@ def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str
 def set_outfile(validation_run, run_dir):
     outfile = first_file_in(run_dir, ".nc")
     if outfile is not None:
-        outfile = regex_sub("/?" + OUTPUT_FOLDER + "/?", "", outfile)
-        validation_run.output_file.name = outfile
+        out_norm = os.path.normpath(outfile)
+        root_norm = os.path.normpath(OUTPUT_FOLDER)
+
+        if os.path.isabs(out_norm):
+            try:
+                in_output_root = os.path.commonpath([out_norm, root_norm]) == root_norm
+            except ValueError:
+                in_output_root = False
+
+            if in_output_root:
+                out_norm = os.path.relpath(out_norm, root_norm)
+            else:
+                out_norm = os.path.basename(out_norm)
+
+        validation_run.output_file.name = out_norm
 
 
 def save_validation_config(validation_run):
@@ -589,6 +602,14 @@ def execute_job(
             )
             return result
         except Exception as e:
+            if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
+                __logger.warning(
+                    "Job {} from validation {} hit non-retriable key error {}. "
+                    "Marking job as empty result and continuing.".format(
+                        task_id, validation_run.id, e
+                    )
+                )
+                return {}
             if attempt < max_retries:
                 __logger.warning(
                     "Job {} from validation {} failed on attempt {}/{}: {}. Retrying in {} seconds.".format(
@@ -610,7 +631,35 @@ def check_and_store_results(job_id, results, save_path):
         __logger.warning("Potentially problematic job: {} - no results".format(job_id))
         return
 
-    netcdf_results_manager(results, save_path)
+    try:
+        netcdf_results_manager(results, save_path)
+    except OSError as exc:
+        # A stale/corrupted nc file from a previous interrupted run can break appends.
+        msg = str(exc)
+        recoverable = (
+            "NetCDF: Unknown file format" in msg
+            or "NetCDF: Write to read only" in msg
+        )
+        if not recoverable:
+            raise
+
+        bad_file = None
+        for token in msg.split("'"):
+            if token.lower().endswith(".nc"):
+                bad_file = token
+                break
+
+        if bad_file and os.path.exists(bad_file):
+            __logger.warning(
+                "Detected corrupted netCDF result file for job %s. Removing %s and retrying write once.",
+                job_id,
+                bad_file,
+            )
+            os.remove(bad_file)
+            netcdf_results_manager(results, save_path)
+            return
+
+        raise
 
 
 def track_validation_task(validation_run, task_id):
@@ -642,6 +691,24 @@ def run_validation(validation_run):
         run_dir = os.path.join(OUTPUT_FOLDER, str(validation_run.id))
         mkdir_if_not_exists(run_dir)
 
+        # Clear stale netCDF outputs when reusing the same validation id.
+        stale_nc_files = [
+            os.path.join(run_dir, name)
+            for name in os.listdir(run_dir)
+            if name.endswith(".nc")
+        ]
+        if stale_nc_files:
+            for nc_file in stale_nc_files:
+                try:
+                    os.remove(nc_file)
+                except OSError:
+                    __logger.warning("Could not remove stale netCDF file %s", nc_file)
+            __logger.info(
+                "Removed %s stale netCDF file(s) from %s before starting validation.",
+                len(stale_nc_files),
+                run_dir,
+            )
+
         ref_reader, read_name, read_kwargs = _get_spatial_reference_reader(
             validation_run
         )
@@ -663,6 +730,12 @@ def run_validation(validation_run):
             settings, "MAX_PARALLEL_WORKERS", os.cpu_count() or 1
         )
         max_workers = max(1, min(len(jobs), configured_workers))
+        if isinstance(ref_reader, ISMN_Interface) and max_workers > 1:
+            __logger.warning(
+                "ISMN reference reader is not safe for threaded execution in this runtime. "
+                "Forcing max_workers=1 to keep validation stable."
+            )
+            max_workers = 1
         __logger.info(
             "Running validation {} with {} parallel workers.".format(
                 validation_run.id, max_workers
