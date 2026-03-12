@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "dask[distributed]>=2026.1.2",
     "ismn>=1.5.2",
     "numpy>=2.4.3",
     "pandas>=3.0.1",
@@ -16,5 +17,8 @@ dependencies = [
     "rioxarray>=0.22.0",
     "scipy>=1.17.1",
     "smap-io>=0.8",
-    "xarray>=2026.2.0"
+    "xarray>=2026.2.0",
 ]
+
+[project.scripts]
+qa4sm-validate = "validator.cli:main"
