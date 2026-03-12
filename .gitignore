@@ -9,4 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
+logs/
+*.log
+
+media/
+
+presets/
+
 *.code-workspace

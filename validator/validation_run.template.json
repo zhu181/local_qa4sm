@@ -1,0 +1,118 @@
+{
+  "validation_run": {
+    "id": 10001,
+    "name_tag": "demo-validation",
+    "scaling_method": "none",
+    "interval_from": "2020-01-01",
+    "interval_to": "2020-12-31",
+    "anomalies": "none",
+    "anomalies_from": null,
+    "anomalies_to": null,
+    "upscaling_method": "none",
+    "temporal_stability": false,
+    "output_file": "",
+    "tcol": false,
+    "bootstrap_tcol_cis": false,
+    "temporal_matching": 12,
+    "plots_save_metadata": "threshold",
+    "intra_annual_metrics": false,
+    "intra_annual_type": null,
+    "intra_annual_overlap": null,
+    "stability_metrics": false,
+    "min_lat": null,
+    "min_lon": null,
+    "max_lat": null,
+    "max_lon": null,
+
+    "dataset_configurations": [
+      {
+        "id": 101,
+        "is_spatial_reference": true,
+        "is_temporal_reference": true,
+        "is_scaling_reference": false,
+        "dataset": {
+          "id": 1,
+          "short_name": "SPL3SMPE",
+          "pretty_name": "SPL3SMPE",
+          "help_text": "Reference dataset used for validation",
+          "storage_path": "E:\\DATA\\Ts_smap1",
+          "reader": "SMAPL3_V9Reader",
+          "detailed_description": "",
+          "source_reference": "",
+          "citation": "",
+          "is_spatial_reference": true,
+          "is_scattered_data": false
+        },
+        "version": {
+          "id": 11,
+          "short_name": "006",
+          "pretty_name": "Reference Version",
+          "help_text": "",
+          "time_range_start": "2019-01-01",
+          "time_range_end": "2024-12-31",
+          "geographical_range": null,
+          "filters": [],
+          "variables": []
+        },
+        "variable": {
+          "id": 21,
+          "short_name": "soil_moisture",
+          "pretty_name": "Soil Moisture",
+          "help_text": "",
+          "unit": "m3/m3",
+          "min_value": null,
+          "max_value": null,
+          "display_name": "Soil Moisture"
+        },
+        "filters": [],
+        "parametrised_filters": []
+      },
+      {
+        "id": 102,
+        "is_spatial_reference": false,
+        "is_temporal_reference": false,
+        "is_scaling_reference": true,
+        "dataset": {
+          "id": 2,
+          "short_name": "SMMerge",
+          "pretty_name": "Merged Soil Moisture",
+          "help_text": "Dataset to compare against reference",
+          "storage_path": "E:/DATA/Ts_merge/timeseries",
+          "reader": "GriddedNcOrthoMultiTs",
+          "detailed_description": "",
+          "source_reference": "",
+          "citation": "",
+          "is_spatial_reference": false,
+          "is_scattered_data": false
+        },
+        "version": {
+          "id": 12,
+          "short_name": "1.0",
+          "pretty_name": "Test Version",
+          "help_text": "",
+          "time_range_start": "2019-01-01",
+          "time_range_end": "2024-12-31",
+          "geographical_range": null,
+          "filters": [],
+          "variables": []
+        },
+        "variable": {
+          "id": 22,
+          "short_name": "soil_moisture",
+          "pretty_name": "Soil Moisture",
+          "help_text": "",
+          "unit": "m3/m3",
+          "min_value": null,
+          "max_value": null,
+          "display_name": "Soil Moisture"
+        },
+        "filters": [],
+        "parametrised_filters": []
+      }
+    ],
+
+    "spatial_reference_configuration": 101,
+    "temporal_reference_configuration": 101,
+    "scaling_ref": 102
+  }
+}
