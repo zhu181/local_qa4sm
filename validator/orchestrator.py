@@ -135,7 +135,7 @@ def _parse_dataset_configuration(payload: dict[str, Any], validation: Validation
 		is_temporal_reference=payload.get("is_temporal_reference", True),
 		is_scaling_reference=payload.get("is_scaling_reference", True),
 	)
-	config.parametrisedfilter_set = parametrised_filters
+	config.parametrised_filters = parametrised_filters
 	return config
 
 

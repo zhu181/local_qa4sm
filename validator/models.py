@@ -14,7 +14,7 @@ class DatasetConfiguration:
     version: "DatasetVersion"
     variable: "DataVariable"
     filters: list["DataFilter"]
-    parametrised_filters: list["DataFilter"]
+    parametrised_filters: list["ParametrisedFilter"]
     is_spatial_reference: bool = True
     is_temporal_reference: bool = True
     is_scaling_reference: bool = True
@@ -46,6 +46,13 @@ class DataVariable:
     def __str__(self):
         return self.short_name
 
+
+@dataclass
+class ParametrisedFilter:
+    id: int
+    dataset_config: "DatasetConfiguration"
+    filter: "DataFilter"
+    parameters: str
 
 @dataclass
 class DataFilter:
@@ -225,6 +232,8 @@ class ValidationRun:
     intra_annual_overlap: Optional[int] = None
 
     stability_metrics: bool = False
+
+    dataset_configurations: list[DatasetConfiguration] = field(default_factory=list)
 
 
 class ValidationTaskDoesNotExist(Exception):

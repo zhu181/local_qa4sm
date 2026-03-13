@@ -34,7 +34,7 @@ from pytesmo.validation_framework.metric_calculators_adapters import (
 from pytz import UTC
 import pytz
 from ismn.interface import ISMN_Interface
-from validator.models import ValidationTask
+from validator.models import DatasetVersion, ValidationTask
 from validator.models import ValidationRun
 from validator.batches import create_jobs, create_upscaling_lut
 from validator.filters import setup_filtering
@@ -57,11 +57,11 @@ from qa4sm_reader.intra_annual_temp_windows import (
     TemporalSubWindowsFactory,
 )
 from qa4sm_reader.netcdf_transcription import Pytesmo2Qa4smResultsTranscriber
-
+from validator.graphics import generate_all_graphs
 __logger = logging.getLogger(__name__)
 
 
-def _get_actual_time_range(val_run, dataset_version):
+def _get_actual_time_range(val_run:ValidationRun, dataset_version:DatasetVersion):
     try:
         vs_start = dataset_version.time_range_start
         vs_start_time = datetime.strptime(vs_start, "%Y-%m-%d").date()
@@ -87,7 +87,6 @@ def _get_actual_time_range(val_run, dataset_version):
         # exception will arise for ISMN, and for that one we can use entire range
         actual_start = START_TIME
         actual_end = END_TIME
-        raise
 
     return [actual_start, actual_end]
 
@@ -109,7 +108,7 @@ def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str
         reader=time_adapted_ref_reader,
         filters=list(val_run.spatial_reference_configuration.filters),
         param_filters=list(
-            val_run.spatial_reference_configuration.parametrisedfilter_set
+            val_run.spatial_reference_configuration.parametrised_filters
         ),
         dataset=val_run.spatial_reference_configuration.dataset,
         variable=val_run.spatial_reference_configuration.variable,
@@ -121,7 +120,7 @@ def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str
     return ref_reader, read_name, read_kwargs
 
 
-def set_outfile(validation_run, run_dir):
+def set_outfile(validation_run:ValidationRun, run_dir:str):
     outfile = first_file_in(run_dir, ".nc")
     if outfile is not None:
         out_norm = os.path.normpath(outfile)
@@ -138,13 +137,13 @@ def set_outfile(validation_run, run_dir):
             else:
                 out_norm = os.path.basename(out_norm)
 
-        validation_run.output_file.name = out_norm
+        validation_run.output_file = out_norm
 
 
-def save_validation_config(validation_run):
+def save_validation_config(validation_run:ValidationRun):
     try:
         with netCDF4.Dataset(
-            os.path.join(OUTPUT_FOLDER, validation_run.output_file.name),
+            os.path.join(OUTPUT_FOLDER, validation_run.output_file),
             "a",
             format="NETCDF4",
         ) as ds:
@@ -170,18 +169,18 @@ def save_validation_config(validation_run):
                 )
 
             j = 1
-            for dataset_config in validation_run.dataset_configurations.all():
+            for dataset_config in validation_run.dataset_configurations:
                 filters = None
-                if dataset_config.filters.all():
+                if dataset_config.filters:
                     filters = "; ".join(
-                        [x.description for x in dataset_config.filters.all()]
+                        [x.description for x in dataset_config.filters]
                     )
-                if dataset_config.parametrisedfilter_set.all():
+                if dataset_config.parametrised_filters:
                     if filters:
                         filters += ";"
                     _list_comp = [
                         pf.filter.description + " " + pf.parameters
-                        for pf in dataset_config.parametrisedfilter_set.all()
+                        for pf in dataset_config.parametrised_filters
                     ]
                     try:
                         filters += "; ".join(_list_comp)
@@ -308,7 +307,7 @@ def save_validation_config(validation_run):
         __logger.exception("Validation configuration could not be stored.")
 
 
-def create_pytesmo_validation(validation_run):
+def create_pytesmo_validation(validation_run:ValidationRun):
     ds_list = []
     ds_read_names = []
     spatial_ref_name = None
@@ -317,7 +316,7 @@ def create_pytesmo_validation(validation_run):
     spatial_ref_short_name = None
 
     ds_num = 1
-    for dataset_config in validation_run.dataset_configurations.all():
+    for dataset_config in validation_run.dataset_configurations:
         reader = create_reader(dataset_config.dataset, dataset_config.version)
 
         time_adapted_reader = adapt_timestamp(
@@ -326,8 +325,8 @@ def create_pytesmo_validation(validation_run):
 
         reader, read_name, read_kwargs = setup_filtering(
             reader=time_adapted_reader,
-            filters=list(dataset_config.filters.all()),
-            param_filters=list(dataset_config.parametrisedfilter_set.all()),
+            filters=list(dataset_config.filters),
+            param_filters=list(dataset_config.parametrised_filters),
             dataset=dataset_config.dataset,
             variable=dataset_config.variable,
         )
@@ -683,7 +682,7 @@ def untrack_validation_task(task_id):
         __logger.debug("Task {} already deleted from db.".format(task_id))
 
 
-def run_validation(validation_run):
+def run_validation(validation_run:ValidationRun):
     __logger.info("Starting validation: {}".format(validation_run.id))
     validation_aborted = False
 
@@ -720,7 +719,6 @@ def run_validation(validation_run):
         )
 
         validation_run.total_points = total_points
-        validation_run.save()  # save the number of gpis before we start
 
         __logger.debug("Jobs to run: {}".format([job[:-1] for job in jobs]))
 
@@ -843,7 +841,6 @@ def run_validation(validation_run):
                         )
                     else:
                         validation_run.progress = -1
-                    validation_run.save()
                     __logger.info(
                         "Dealt with task {}, validation {} is {} % done...".format(
                             task_id, validation_run.id, validation_run.progress
@@ -863,7 +860,7 @@ def run_validation(validation_run):
 
             transcriber = Pytesmo2Qa4smResultsTranscriber(
                 pytesmo_results=os.path.join(
-                    OUTPUT_FOLDER, validation_run.output_file.name
+                    OUTPUT_FOLDER, validation_run.output_file
                 ),
                 intra_annual_slices=temp_sub_wdw_instance,
                 keep_pytesmo_ncfile=False,
@@ -904,7 +901,6 @@ def run_validation(validation_run):
 
     finally:
         validation_run.end_time = datetime.now(tzlocal())
-        validation_run.save()
         __logger.info(
             "Validation finished: {}. Jobs: {}, Errors: {}, OK: {}, End time: {} ".format(
                 validation_run,

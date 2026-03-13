@@ -7,6 +7,7 @@ from ismn.interface import ISMN_Interface
 from pygeobase.io_base import GriddedBase
 
 from validator import globals
+from validator.models import DatasetConfiguration, ValidationRun
 from validator.readers import ReaderWithTsExtension
 from smap_io.interface import ReaderWithExtension_SMAP
 
@@ -117,9 +118,9 @@ def _geographic_subsetting(gpis, lons, lats, min_lat, min_lon, max_lat, max_lon)
 
 
 def create_jobs(
-    validation_run,
+    validation_run: ValidationRun,
     reader,
-    dataset_config,
+    dataset_config: DatasetConfiguration,
     return_points=True,
 ) -> Union[tuple, list]:
     """
@@ -184,7 +185,7 @@ def create_jobs(
 
     # if we've got ISMN data, process one network at a time
     elif isinstance(reader, ISMN_Interface):
-        depth_from, depth_to = get_depths_params(dataset_config.parametrisedfilter_set)
+        depth_from, depth_to = get_depths_params(dataset_config.parametrised_filters)
         filter_meta_dict = get_meta_filter_dict(list(dataset_config.filters))
 
         try:
@@ -269,7 +270,7 @@ def create_jobs(
     return total_points, jobs
 
 
-def create_upscaling_lut(validation_run, datasets, spatial_ref_name) -> dict:
+def create_upscaling_lut(validation_run:ValidationRun, datasets, spatial_ref_name) -> dict:
     """
     Create a lookup table that aggregates the non-reference measurement
     points falling under the same reference
@@ -305,7 +306,7 @@ def create_upscaling_lut(validation_run, datasets, spatial_ref_name) -> dict:
     # a bit of a kack to match dataset name and configuation
     for other_name, other_config in zip(
         datasets.keys(),
-        validation_run.dataset_configurations.all(),
+        validation_run.dataset_configurations,
     ):
         if other_name == spatial_ref_name:
             continue
