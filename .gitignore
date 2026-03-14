@@ -13,7 +13,7 @@ logs/
 *.log
 
 media/
-
+outputs/
 presets/
 
 *.code-workspace
