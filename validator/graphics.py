@@ -31,6 +31,8 @@ from io import BytesIO
 import base64
 from parse import parse
 
+from validator.models import ValidationRun
+
 # cconfig["data_dir"] = path.join(settings.BASE_DIR, "cartopy")
 plt.switch_backend("agg")  ## this allows headless graph production
 
@@ -38,7 +40,7 @@ __logger = logging.getLogger(__name__)
 
 
 def generate_all_graphs(
-    validation_run,
+    validation_run:ValidationRun,
     temporal_sub_windows: List[str],
     outfolder: str,
     save_metadata="threshold",
@@ -57,7 +59,7 @@ def generate_all_graphs(
         Directoy where graphs are stored.
     save_metadata: str, optional (default: 'threshold')
         'threshold' will only create box plots if there are enough observations
-        'all' will create all plots, even if there are not enough observations
+        'always' will create all plots, even if there are not enough observations
         'never' will never create box plots
     """
     if not validation_run.output_file:
@@ -67,7 +69,7 @@ def generate_all_graphs(
     __logger.debug("Trying to create zipfile {}".format(zipfilename))
 
     fnb, fnm, fcsv, fncb = plot_all(
-        validation_run.output_file.path,
+        validation_run.output_file,
         temporal_sub_windows=temporal_sub_windows,
         out_dir=outfolder,
         out_type=["png", "svg"],
@@ -104,7 +106,7 @@ def generate_all_graphs(
     )
 
 
-def get_dataset_combis_and_metrics_from_files(validation_run):
+def get_dataset_combis_and_metrics_from_files(validation_run:ValidationRun):
     """
     Go through plots of validation run and detect the dataset names and ids.
     Create combinations of id-REF_and_id-SAT to show the plots on the results
@@ -228,7 +230,7 @@ def get_dataset_combis_and_metrics_from_files(validation_run):
     return pairs, triples, metrics, ref0_config
 
 
-def get_inspection_table(validation_run):
+def get_inspection_table(validation_run:ValidationRun):
     """
     Generate the quick inspection table with the summary statistics of the results
 
@@ -248,8 +250,8 @@ def get_inspection_table(validation_run):
         run_dir += "bulk/"
     # the first condition checks whether the outfile field has been properly
     # set, the second then whether the file really exists
-    if bool(outfile) and path.exists(outfile.path):
-        file_size = os.path.getsize(outfile.path)
+    if bool(outfile) and path.exists(outfile):
+        file_size = os.path.getsize(outfile)
 
         stats_file = None
         for root, dirs, files in os.walk(run_dir):
@@ -269,7 +271,7 @@ def get_inspection_table(validation_run):
             # Return string to distinguish with 'None' in first conditional statement
             return "No output"
         else:
-            stats = get_img_stats(outfile.path)
+            stats = get_img_stats(outfile)
 
         stats = stats.drop(columns="Group", errors="ignore")
         return stats
