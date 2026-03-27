@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import signal
 import warnings
 from pathlib import Path
 
@@ -11,6 +12,30 @@ from validator.orchestrator import (
 
 LOGGER = logging.getLogger(__name__)
 _ORIGINAL_SHOWWARNING = warnings.showwarning
+
+
+def _install_termination_signal_handlers() -> None:
+	"""Convert termination signals into a logged KeyboardInterrupt path."""
+
+	def _handler(signum, _frame):
+		try:
+			signame = signal.Signals(signum).name
+		except Exception:
+			signame = f"signal-{signum}"
+		LOGGER.warning(
+			"Received %s. Stopping validation run gracefully...",
+			signame,
+		)
+		raise KeyboardInterrupt()
+
+	for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+		if sig is None:
+			continue
+		try:
+			signal.signal(sig, _handler)
+		except (ValueError, OSError):
+			# Signal registration may fail in non-main threads or constrained runtimes.
+			continue
 
 
 def _install_warning_suppression() -> None:
@@ -226,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
 	parser = _build_parser()
 	args = parser.parse_args(argv)
 	noise_filter = _configure_logging(args.log_level, args.log_file)
+	_install_termination_signal_handlers()
 
 	config_path = Path(args.config)
 	if not config_path.exists():
@@ -265,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
 			result.error_points,
 		)
 		return 0
+	except KeyboardInterrupt:
+		LOGGER.warning("Validation CLI interrupted before completion.")
+		return 130
 	except Exception:
 		LOGGER.exception("Validation CLI failed")
 		return 1
