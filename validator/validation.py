@@ -570,7 +570,7 @@ def num_gpis_from_job(job):
 
 
 def execute_job(
-    validation_run, job, task_id=None, max_retries=3, retry_delay_seconds=2
+    validation_run, job, task_id=None, max_retries=1, retry_delay_seconds=1
 ):
     if task_id is None:
         task_id = uuid.uuid4().hex
@@ -739,6 +739,10 @@ def run_validation(validation_run:ValidationRun):
                 validation_run.id, max_workers
             )
         )
+        total_jobs = len(jobs)
+        run_started_at = time.monotonic()
+        last_heartbeat_at = run_started_at
+        heartbeat_interval = getattr(settings, "HEARTBEAT_INTERVAL_SECONDS", 60)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task_id = {}
@@ -754,6 +758,21 @@ def run_validation(validation_run:ValidationRun):
             pending = set(future_to_task_id.keys())
             while pending:
                 done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
+
+                now = time.monotonic()
+                if now - last_heartbeat_at >= heartbeat_interval:
+                    completed_jobs = total_jobs - len(pending)
+                    elapsed_seconds = int(now - run_started_at)
+                    __logger.info(
+                        "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s pending=%s",
+                        validation_run.id,
+                        elapsed_seconds,
+                        validation_run.progress,
+                        completed_jobs,
+                        total_jobs,
+                        len(pending),
+                    )
+                    last_heartbeat_at = now
 
                 # no completed task in this interval; continue polling to allow cancellation checks
                 if not done:
