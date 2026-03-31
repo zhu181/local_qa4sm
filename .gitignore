@@ -15,5 +15,6 @@ logs/
 media/
 outputs/
 presets/
+data/
 
 *.code-workspace
