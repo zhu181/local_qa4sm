@@ -886,9 +886,11 @@ def run_validation(validation_run:ValidationRun):
             )
             if transcriber.exists:
                 restructured_results = transcriber.get_transcribed_dataset()
-                transcriber.output_file_name = transcriber.build_outname(
+                outname, outname_zarr = transcriber.build_outname(
                     run_dir, results.keys()
                 )
+                transcriber.output_file_name = str(outname)
+                transcriber.output_zarr_name = str(outname_zarr)
                 transcriber.write_to_netcdf(transcriber.output_file_name)
 
                 save_validation_config(validation_run)

@@ -68,8 +68,15 @@ def generate_all_graphs(
     zipfilename = path.join(outfolder, "graphs.zip")
     __logger.debug("Trying to create zipfile {}".format(zipfilename))
 
+    # Ensure we pass an absolute path to the plotting routines. The
+    # `validation_run.output_file` may be stored relative to OUTPUT_FOLDER.
+    if os.path.isabs(validation_run.output_file):
+        plot_filepath = validation_run.output_file
+    else:
+        plot_filepath = os.path.join(OUTPUT_FOLDER, validation_run.output_file)
+
     fnb, fnm, fcsv, fncb = plot_all(
-        validation_run.output_file,
+        plot_filepath,
         temporal_sub_windows=temporal_sub_windows,
         out_dir=outfolder,
         out_type=["png", "svg"],
