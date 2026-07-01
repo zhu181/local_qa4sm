@@ -1,6 +1,6 @@
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 from typing import ClassVar, Optional, Union
 
@@ -281,7 +281,7 @@ class ValidationTaskManager:
 class ValidationTask:
     validation: Optional[ValidationRun] = None
     task_id: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     _store: ClassVar[dict[str, "ValidationTask"]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
