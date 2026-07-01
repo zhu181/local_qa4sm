@@ -12,7 +12,6 @@ from zipfile import ZipFile, ZIP_DEFLATED
 from qa4sm_reader.plot_all import plot_all, get_img_stats
 from qa4sm_reader.comparing import QA4SMComparison, ComparisonError, SpatialExtentError
 
-from cartopy import config as cconfig
 from typing import List, Tuple, Dict, Set
 from pathlib import Path
 
@@ -33,8 +32,7 @@ from parse import parse
 
 from validator.models import ValidationRun
 
-# cconfig["data_dir"] = path.join(settings.BASE_DIR, "cartopy")
-plt.switch_backend("agg")  ## this allows headless graph production
+plt.switch_backend("agg")
 
 __logger = logging.getLogger(__name__)
 

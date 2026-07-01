@@ -443,22 +443,6 @@ def create_pytesmo_validation(validation_run:ValidationRun):
         calc_kendall=False,
     )
 
-    # as all testfiles and tests in the qa4sm_reader package still have Kendall's tau included and
-    # qa4sm get's its list of METRICS from the qa4sm_reader.globals.py. In the line above "calc_kendall=False", which
-    # means that in the qa4sm_reader.globals.py the METRICS needs to be manually set to exclude Kendall's tau.
-    # to streamline the process, smth like this could be done:
-
-    # if all(metric in METRICS for metric in ['tau', 'p_tau']):
-    #   _calc_kendall = True
-    # else:
-    #  _calc_kendall = False
-
-    # _pairwise_metrics = PairwiseIntercomparisonMetrics(
-    #     metadata_template=metadata_template,
-    #     calc_kendall=_calc_kendall,
-    # )
-
-    # TODO: this should be move to the api view
     if validation_run.intra_annual_metrics and validation_run.stability_metrics:
         raise ValueError(
             "Both intra_annual_metrics and stability_metrics cannot be True at the same time."
@@ -980,12 +964,6 @@ def _pytesmo_to_qa4sm_results(results: dict) -> dict:
                         metric
                     )  # casts the string representing a tuple to a real tuple
                 if isinstance(metric, tuple):
-                    # happens only for triple collocation metrics, where the
-                    # metric key is a tuple of (metric, dataset)
-                    # if metric[1].startswith("0-"):
-                    #     # triple collocation metrics for the reference should
-                    #     # not show up in the results
-                    #     continue
                     new_metric = "_".join(metric)
                 else:
                     new_metric = metric
