@@ -83,7 +83,7 @@ def _get_actual_time_range(val_run:ValidationRun, dataset_version:DatasetVersion
             else vs_end_time.strftime("%Y-%m-%d")
         )
 
-    except:
+    except Exception:
         # exception will arise for ISMN, and for that one we can use entire range
         actual_start = START_TIME
         actual_end = END_TIME

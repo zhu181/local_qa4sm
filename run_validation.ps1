@@ -7,7 +7,7 @@ param(
     [int]$MaxWorkers = 0
 )
 
-$python = "C:/Users/30922/Documents/source/local_qa4sm/.venv/Scripts/python.exe"
+$python = Join-Path $PSScriptRoot ".venv" "Scripts" "python.exe"
 $args = @("-m", "validator.cli", $Config, "--log-level", $LogLevel)
 
 if ($DryRun) {

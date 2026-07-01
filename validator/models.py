@@ -49,10 +49,10 @@ class DataVariable:
 
 @dataclass
 class ParametrisedFilter:
-    id: int
-    dataset_config: "DatasetConfiguration"
-    filter: "DataFilter"
-    parameters: str
+    id: int = 0
+    dataset_config: Optional["DatasetConfiguration"] = None
+    filter: Optional["DataFilter"] = None
+    parameters: str = ""
 
 @dataclass
 class DataFilter:

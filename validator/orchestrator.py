@@ -4,6 +4,7 @@ from validator.models import (
 	Dataset,
 	DatasetConfiguration,
 	DatasetVersion,
+	ParametrisedFilter,
 	ValidationRun,
 )
 import json
@@ -20,12 +21,6 @@ class Collection(list):
 
 	def all(self):
 		return self
-
-
-@dataclass
-class ParametrizedFilter:
-	filter: DataFilter
-	parameters: str
 
 
 @dataclass
@@ -116,7 +111,9 @@ def _parse_dataset(payload: dict[str, Any]) -> Dataset:
 def _parse_dataset_configuration(payload: dict[str, Any], validation: ValidationRun):
 	filters = Collection(_parse_filter(item) for item in payload.get("filters", []))
 	parametrised_filters = Collection(
-		ParametrizedFilter(
+		ParametrisedFilter(
+			id=0,
+			dataset_config=None,
 			filter=_parse_filter(item.get("filter", item.get("name"))),
 			parameters=item.get("parameters", ""),
 		)
@@ -135,7 +132,6 @@ def _parse_dataset_configuration(payload: dict[str, Any], validation: Validation
 		is_temporal_reference=payload.get("is_temporal_reference", True),
 		is_scaling_reference=payload.get("is_scaling_reference", True),
 	)
-	config.parametrised_filters = parametrised_filters
 	return config
 
 

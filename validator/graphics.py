@@ -14,7 +14,7 @@ from qa4sm_reader.comparing import QA4SMComparison, ComparisonError, SpatialExte
 
 from cartopy import config as cconfig
 from typing import List, Tuple, Dict, Set
-from pathlib import PosixPath
+from pathlib import Path
 
 
 from validator.globals import (

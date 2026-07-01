@@ -18,3 +18,7 @@ presets/
 data/
 
 *.code-workspace
+
+# Sub-projects have their own git history; install via pip/uv from their own repos
+qa4sm-preprocessing/
+qa4sm-reader/
