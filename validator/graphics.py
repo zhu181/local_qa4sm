@@ -496,8 +496,8 @@ def clean_output_folder(dir: str, to_be_deleted: List[str]) -> None:
 
 
 def sort_filenames_to_filetypes(
-    plot_output: Tuple[List[PosixPath]],
-) -> Dict[str, Dict[str, List[PosixPath]]]:
+    plot_output: Tuple[List[Path]],
+) -> Dict[str, Dict[str, List[Path]]]:
     """
     Sorts the files, that are the output of the `qa4sm_reader.plot_all.plot_all()` into a dictionary. \
         The four keys correspond to the four lists of the `qa4sm_reader.plot_all.plot_all()` output,\
@@ -506,12 +506,12 @@ def sort_filenames_to_filetypes(
 
     Parameters
     ----------
-    plot_output : Tuple[List[PosixPath]]
+    plot_output : Tuple[List[Path]]
         The output of the `qa4sm_reader.plot_all.plot_all()` function
 
     Returns
     -------
-    _out_dict : Dict[str, Dict[str, List[PosixPath]]]
+    _out_dict : Dict[str, Dict[str, List[Path]]]
         A dictionary with the four keys 'fnb', 'fnm', 'fcsv', 'fncb' and each value being a dictionary of the file \
             types as key and a list of filepaths as value.
     """
@@ -536,14 +536,14 @@ def sort_filenames_to_filetypes(
 
 
 def files_to_zip(
-    plot_dict: Dict[str, Dict[str, List[PosixPath]]], filetype: str
-) -> Set[PosixPath]:
+    plot_dict: Dict[str, Dict[str, List[Path]]], filetype: str
+) -> Set[Path]:
     """
     Collects the files of a given filetype from the plot_dict and returns them as a set.
 
     Parameters
     ----------
-    plot_dict : Dict[str, Dict[str, List[PosixPath]]]
+    plot_dict : Dict[str, Dict[str, List[Path]]]
         The dictionary containing the filepaths of the different filetypes. \
             This should be the output of the `sort_filenames_to_filetypes()` function.
     filetype : str
@@ -551,7 +551,7 @@ def files_to_zip(
 
     Returns
     -------
-    _files : Set[PosixPath]
+    _files : Set[Path]
         A set of the filepaths of the given filetype.
     """
     _files = plot_dict["fnb"][filetype] + plot_dict["fnm"][filetype]
