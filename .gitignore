@@ -18,6 +18,7 @@ presets/
 data/
 
 *.code-workspace
+.vscode/
 
 # Sub-projects have their own git history; install via pip/uv from their own repos
 qa4sm-preprocessing/

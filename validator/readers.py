@@ -1,21 +1,19 @@
 import logging
 from os import listdir, path
-from netCDF4 import Dataset as NetCDFDataset
 
-from ismn.interface import ISMN_Interface
+import pandas as pd
 from ismn.custom import CustomSensorMetadataCsv
-from smap_io.interface import SMAPTs, SMAPL3_V9Reader, ReaderWithExtension_SMAP
-from pynetcf.time_series import GriddedNcTs, GriddedNcIndexedRaggedTs
+from ismn.interface import ISMN_Interface
+from netCDF4 import Dataset as NetCDFDataset
+from pynetcf.time_series import GriddedNcIndexedRaggedTs, GriddedNcTs
+from pytesmo.validation_framework.adapters import TimestampAdapter
 from qa4sm_preprocessing.reading import (
-    GriddedNcOrthoMultiTs,
     GriddedNcContiguousRaggedTs,
+    GriddedNcOrthoMultiTs,
 )
+from smap_io.interface import ReaderWithExtension_SMAP, SMAPL3_V9Reader, SMAPTs
 
 from validator import globals
-
-from pytesmo.validation_framework.adapters import TimestampAdapter
-import pandas as pd
-
 from validator.models import Dataset
 
 __logger = logging.getLogger(__name__)
@@ -24,25 +22,21 @@ __logger = logging.getLogger(__name__)
 def _uses_indexed_ragged_format(ts_path: str) -> bool:
     try:
         netcdf_files = sorted(
-            filename
-            for filename in listdir(ts_path)
-            if filename.endswith('.nc') and filename != 'grid.nc'
+            filename for filename in listdir(ts_path) if filename.endswith(".nc") and filename != "grid.nc"
         )
         if not netcdf_files:
             return False
 
         sample_file = path.join(ts_path, netcdf_files[0])
-        with NetCDFDataset(sample_file, 'r') as ds:
-            if 'locationIndex' not in ds.variables:
+        with NetCDFDataset(sample_file, "r") as ds:
+            if "locationIndex" not in ds.variables:
                 return False
-            soil_moisture = ds.variables.get('soil_moisture')
+            soil_moisture = ds.variables.get("soil_moisture")
             if soil_moisture is None:
                 return True
             return len(soil_moisture.dimensions) == 1
     except Exception as exc:
-        __logger.warning(
-            'Failed to inspect SMAP file structure in %s: %s', ts_path, exc
-        )
+        __logger.warning("Failed to inspect SMAP file structure in %s: %s", ts_path, exc)
         return False
 
 
@@ -87,9 +81,7 @@ class ReaderWithTsExtension:
                 ts = pd.concat([ts, ext], axis=0)
                 ts = ts[~ts.index.duplicated(keep="last")]  # prefer ext. data
         except Exception as e:
-            logging.error(
-                f"Extension reading failed for {args} {kwargs} witherror: {e}"
-            )
+            logging.exception(f"Extension reading failed for {args} {kwargs} witherror: {e}")
 
         return ts
 
@@ -144,50 +136,45 @@ class SMOSL2Reader(GriddedNcIndexedRaggedTs):
         return ts
 
 
-def create_reader(dataset:Dataset, version) -> GriddedNcTs:
-    """
-    Create basic readers (without any adapters / filters) for a dataset version
-    """
+def _create_ismn_reader(dataset: Dataset, version) -> ISMN_Interface:
+    if path.isfile(path.join(dataset.storage_path, "frm_classification.csv")):
+        custom_meta_readers = [
+            CustomSensorMetadataCsv(
+                path.join(dataset.storage_path, "frm_classification.csv"),
+                fill_values={"frm_class": "undeducible"},
+            ),
+        ]
+    else:
+        custom_meta_readers = None
+    return ISMN_Interface(dataset.storage_path, custom_meta_reader=custom_meta_readers)
 
-    reader = None
 
-    if dataset.reader == "ISMN_Interface":
-        if path.isfile(path.join(dataset.storage_path, "frm_classification.csv")):
-            custom_meta_readers = [
-                CustomSensorMetadataCsv(
-                    path.join(dataset.storage_path, "frm_classification.csv"),
-                    fill_values={"frm_class": "undeducible"},
-                ),
-            ]
-        else:
-            custom_meta_readers = None
-        reader = ISMN_Interface(dataset.storage_path, custom_meta_reader=custom_meta_readers)
+def _create_smap_ts_reader(dataset: Dataset, version) -> GriddedNcTs:
+    if _uses_indexed_ragged_format(dataset.storage_path):
+        __logger.warning(
+            "Dataset %s configured as SMAPTs but files are indexed ragged; falling back to SMAPL3_V9Reader.",
+            dataset.short_name,
+        )
+        return SMAPL3_V9Reader(dataset.storage_path, ioclass_kws={"read_bulk": True})
+    return SMAPTs(dataset.storage_path, ioclass_kws={"read_bulk": True})
 
-    if dataset.reader == "SMAPTs":
-        if _uses_indexed_ragged_format(dataset.storage_path):
-            __logger.warning(
-                "Dataset %s configured as SMAPTs but files are indexed ragged; falling back to SMAPL3_V9Reader.",
-                dataset.short_name,
-            )
-            reader = SMAPL3_V9Reader(
-                dataset.storage_path, ioclass_kws={"read_bulk": True}
-            )
-        else:
-            reader = SMAPTs(dataset.storage_path, ioclass_kws={"read_bulk": True})
 
-    if dataset.reader == "SMAPL3_V9Reader":
-        reader = SMAPL3_V9Reader(dataset.storage_path, ioclass_kws={"read_bulk": True})
+_READER_REGISTRY: dict[str, callable] = {
+    "ISMN_Interface": _create_ismn_reader,
+    "SMAPTs": _create_smap_ts_reader,
+    "SMAPL3_V9Reader": lambda d, v: SMAPL3_V9Reader(d.storage_path, ioclass_kws={"read_bulk": True}),
+    "GriddedNcOrthoMultiTs": lambda d, v: GriddedNcOrthoMultiTs(d.storage_path, ioclass_kws={"read_bulk": True}),
+    "GriddedNcContiguousRaggedTs": lambda d, v: GriddedNcContiguousRaggedTs(
+        d.storage_path, ioclass_kws={"read_bulk": True}
+    ),
+}
 
-    if dataset.reader == "GriddedNcOrthoMultiTs":
-        reader = GriddedNcOrthoMultiTs(dataset.storage_path, ioclass_kws={"read_bulk": True})
-    
-    if dataset.reader == "GriddedNcContiguousRaggedTs":
-        reader = GriddedNcContiguousRaggedTs(dataset.storage_path, ioclass_kws={"read_bulk": True})
 
-    if not reader:
-        raise ValueError("Reader for dataset '{}' not available".format(dataset))
-
-    return reader
+def create_reader(dataset: Dataset, version) -> GriddedNcTs:
+    name = dataset.reader
+    if name not in _READER_REGISTRY:
+        raise ValueError(f"Reader '{name}' for dataset '{dataset}' not available")
+    return _READER_REGISTRY[name](dataset, version)
 
 
 def adapt_timestamp(reader, dataset, version):
@@ -200,9 +187,7 @@ def adapt_timestamp(reader, dataset, version):
             "base_time_reference": "2000-01-01",
         }
 
-    elif (dataset.short_name == globals.SMOS_SBPCA) and (
-        version.short_name == globals.SMOS_SBPCA_v724
-    ):
+    elif (dataset.short_name == globals.SMOS_SBPCA) and (version.short_name == globals.SMOS_SBPCA_v724):
         tadapt_kwargs = {
             "base_time_field": "acquisition_time",
             "base_time_reference": "2000-01-01T00:00:00",

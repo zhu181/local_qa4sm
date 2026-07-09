@@ -1,18 +1,21 @@
 import logging
-from typing import List, Union
+from re import sub as regex_sub
 
 import numpy as np
 import pandas as pd
-
+from ismn.interface import ISMN_Interface
 from pytesmo.validation_framework.adapters import (
     AdvancedMaskingAdapter,
     BasicAdapter,
     ColumnCombineAdapter,
 )
-from ismn.interface import ISMN_Interface
-from re import sub as regex_sub
 
 __logger = logging.getLogger(__name__)
+
+
+def _combine_rfi_columns(row):
+    return (row["N_RFI_X"] + row["N_RFI_Y"]) / row["M_AVA0"]
+
 
 """
 Bitmask filter for SMOS, you can only exclude data on set bits (not on unset 
@@ -49,9 +52,7 @@ def smos_exclude_bitmask(data, bitmask):
     return mask
 
 
-def check_normalized_bits_array(
-    numbers: Union[pd.Series, np.ndarray], bit_indices: List[list]
-) -> bool:
+def check_normalized_bits_array(numbers: pd.Series | np.ndarray, bit_indices: list[list]) -> bool:
     """
     Takes a list of bit_indices ([0] is the first bit only, [0,1] are the first
     two bits) and a number and checks if the bit(s) is (are) active for this
@@ -89,12 +90,7 @@ def check_normalized_bits_array(
     numbers = numbers.astype(int)
 
     return ~np.any(
-        np.array(
-            [
-                np.all(np.array([(numbers >> i) & 1 for i in bit_index]), axis=0)
-                for bit_index in bit_indices
-            ]
-        ),
+        np.array([np.all(np.array([(numbers >> i) & 1 for i in bit_index]), axis=0) for bit_index in bit_indices]),
         axis=0,
     )
 
@@ -116,11 +112,7 @@ def get_used_variables(filters, dataset, variable):
                 variables.append("soil_moisture_flag")
                 continue
 
-            if (
-                (fil.name == "FIL_C3S_FLAG_0")
-                or (fil.name == "FIL_C3S_NO_FLAG_1")
-                or (fil.name == "FIL_C3S_NO_FLAG_2")
-            ):
+            if (fil.name == "FIL_C3S_FLAG_0") or (fil.name == "FIL_C3S_NO_FLAG_1") or (fil.name == "FIL_C3S_NO_FLAG_2"):
                 variables.append("flag")
                 continue
 
@@ -282,16 +274,14 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
 
     # restrict the variables that are read from file in the reader
     if hasattr(reader, "parameters"):
-        __logger.debug(
-            "Replacing existing variables to read: {}".format(reader.parameters)
-        )
+        __logger.debug(f"Replacing existing variables to read: {reader.parameters}")
         reader.parameters = load_vars
 
     read_name = "read"
     read_kwargs = {}
 
     if not filters and not param_filters:
-        __logger.debug("No filters to apply for dataset {}.".format(dataset))
+        __logger.debug(f"No filters to apply for dataset {dataset}.")
         return BasicAdapter(reader, read_name=read_name), read_name, read_kwargs
 
     filtered_reader = reader
@@ -302,8 +292,7 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
     # TODO Adapt filters
     for pfil in param_filters:
         __logger.debug(
-            f"Setting up parametrised filter {pfil.filter.name} for "
-            f"dataset {dataset} with parameter {pfil.parameters}"
+            f"Setting up parametrised filter {pfil.filter.name} for dataset {dataset} with parameter {pfil.parameters}"
         )
 
         if pfil.filter.name == "FIL_SMOSL3_RFI":
@@ -328,16 +317,12 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
 
         if pfil.filter.name == "FIL_ASCAT_SUBSURFACE_SCAT_PROB":
             param = regex_sub(regex_str, ",", pfil.parameters)
-            masking_filters.append(
-                ("subsurface_scattering_probability", "<", float(param))
-            )
+            masking_filters.append(("subsurface_scattering_probability", "<", float(param)))
             continue
 
         if pfil.filter.name == "FIL_ASCAT_SSM_SENSITIVITY":
             param = regex_sub(regex_str, ",", pfil.parameters)
-            masking_filters.append(
-                ("surface_soil_moisture_sensitivity", ">", float(param))
-            )
+            masking_filters.append(("surface_soil_moisture_sensitivity", ">", float(param)))
             continue
 
         inner_reader = filtered_reader
@@ -353,9 +338,7 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
             elif isinstance(inner_reader, ISMN_Interface):
                 param = regex_sub(regex_str, ",", pfil.parameters)  # replace whitespace
                 # around commas
-                param = regex_sub(
-                    r"(^ +)|( +$)", "", param
-                )  # replace whitespace at start and end of string
+                param = regex_sub(r"(^ +)|( +$)", "", param)  # replace whitespace at start and end of string
                 paramnetlist = param.split(",")
                 networks = [n for n in paramnetlist if n in inner_reader.networks]
                 __logger.debug("Available networks: " + ";".join(inner_reader.networks))
@@ -363,7 +346,7 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
                 inner_reader.activate_network(networks)
 
     for fil in filters:
-        __logger.debug("Setting up filter {} for dataset {}.".format(fil.name, dataset))
+        __logger.debug(f"Setting up filter {fil.name} for dataset {dataset}.")
 
         if fil.name == "FIL_ALL_VALID_RANGE":
             masking_filters.append((variable.short_name, ">=", variable.min_value))
@@ -414,15 +397,11 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
             continue
 
         if fil.name == "FIL_ASCAT_UNFROZEN_UNKNOWN":
-            masking_filters.append(
-                ("ssf", "<=", 1)
-            )  # TODO: really should be == 0 or == 1
+            masking_filters.append(("ssf", "<=", 1))  # TODO: really should be == 0 or == 1
             continue
 
         if fil.name == "FIL_ASCAT_UNFROZEN_UNKNOWN_new":
-            masking_filters.append(
-                ("surface_flag", "<=", 1)
-            )  # TODO: really should be == 0 or == 1
+            masking_filters.append(("surface_flag", "<=", 1))  # TODO: really should be == 0 or == 1
             continue
 
         if fil.name == "FIL_ASCAT_NO_CONF_FLAGS":
@@ -442,41 +421,25 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
             continue
 
         if fil.name == "FIL_SMOSL2_RFI_good_confidence":
-
-            def comb_rfi(row):
-                # 'COMBINED_RFI' is created using the formula:
-                # (N_RFI_X + N_RFI_Y) / M_AVA0 and the class
-                # pytesmo.validation_framework.adapters.ColumnCombineAdapter
-                return (row["N_RFI_X"] + row["N_RFI_Y"]) / row["M_AVA0"]
-
             filtered_reader = ColumnCombineAdapter(
                 filtered_reader,
-                comb_rfi,
+                _combine_rfi_columns,
                 func_kwargs={"axis": 1},
                 columns=["N_RFI_X", "N_RFI_Y", "M_AVA0"],
                 new_name="COMBINED_RFI",
             )
-
             masking_filters.append(("COMBINED_RFI", "<=", 0.2))
             masking_filters.append(("RFI_Prob", "<=", 0.2))
             continue
 
         if fil.name == "FIL_SMOSL2_RFI_high_confidence":
-
-            def comb_rfi(row):
-                # 'COMBINED_RFI' is created using the formula:
-                # (N_RFI_X + N_RFI_Y) / M_AVA0 and the class
-                # pytesmo.validation_framework.adapters.ColumnCombineAdapter
-                return (row["N_RFI_X"] + row["N_RFI_Y"]) / row["M_AVA0"]
-
             filtered_reader = ColumnCombineAdapter(
                 filtered_reader,
-                comb_rfi,
+                _combine_rfi_columns,
                 func_kwargs={"axis": 1},
                 columns=["N_RFI_X", "N_RFI_Y", "M_AVA0"],
                 new_name="COMBINED_RFI",
             )
-
             masking_filters.append(("COMBINED_RFI", "<=", 0.1))
             masking_filters.append(("RFI_Prob", "<=", 0.1))
             continue
@@ -491,15 +454,11 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
         # =======================================================================================
 
         if fil.name == "FIL_SMOS_TOPO_NO_MODERATE":
-            masking_filters.append(
-                ("Processing_Flags", check_normalized_bits_array, [[0]])
-            )
+            masking_filters.append(("Processing_Flags", check_normalized_bits_array, [[0]]))
             continue
 
         if fil.name == "FIL_SMOS_TOPO_NO_STRONG":
-            masking_filters.append(
-                ("Processing_Flags", check_normalized_bits_array, [[1]])
-            )
+            masking_filters.append(("Processing_Flags", check_normalized_bits_array, [[1]]))
             continue
 
         if fil.name == "FIL_SMOS_UNPOLLUTED":
@@ -511,93 +470,63 @@ def setup_filtering(reader, filters, param_filters, dataset, variable) -> tuple:
             continue
 
         if fil.name == "FIL_SMOS_BRIGHTNESS":
-            masking_filters.append(
-                ("Processing_Flags", check_normalized_bits_array, [[0]])
-            )
+            masking_filters.append(("Processing_Flags", check_normalized_bits_array, [[0]]))
             continue
 
         if fil.name == "FIL_SMOSL3_STRONG_TOPO_MANDATORY":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[3]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[3]]))
             continue
 
         if fil.name == "FIL_SMOSL3_MODERATE_TOPO":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[4]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[4]]))
             continue
 
         if fil.name == "FIL_SMOSL3_ICE_MANDATORY":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[12]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[12]]))
             continue
 
         if fil.name == "FIL_SMOSL3_FROZEN":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[6], [7], [8], [11]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[6], [7], [8], [11]]))
             continue
 
         if fil.name == "FIL_SMOSL3_URBAN_LOW":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[15]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[15]]))
             continue
 
         if fil.name == "FIL_SMOSL3_URBAN_HIGH":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[16]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[16]]))
             continue
 
         if fil.name == "FIL_SMOSL3_WATER":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[5], [13], [14]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[5], [13], [14]]))
             continue
 
         if fil.name == "FIL_SMOSL3_EXTERNAL":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[24], [25]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[24], [25]]))
             continue
 
         if fil.name == "FIL_SMOSL3_TAU_FO":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[27]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[27]]))
             continue
 
         if fil.name == "FIL_SMOSL2_OW":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[5]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[5]]))
             continue
 
         if fil.name == "FIL_SMOSL2_SNOW":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[7], [8], [6]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[7], [8], [6]]))
             continue
 
         if fil.name == "FIL_SMOSL2_ICE":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[12]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[12]]))
             continue
 
         if fil.name == "FIL_SMOSL2_FROST":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[11]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[11]]))
             continue
 
         if fil.name == "FIL_SMOSL2_TOPO_S":
-            masking_filters.append(
-                ("Science_Flags", check_normalized_bits_array, [[3]])
-            )
+            masking_filters.append(("Science_Flags", check_normalized_bits_array, [[3]]))
             continue
 
         if fil.name == "FIL_SMOSL2_ORBIT_DES":

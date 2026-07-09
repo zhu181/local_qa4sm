@@ -14,11 +14,17 @@ dependencies = [
     "pynetcf>=0.5.2",
     "pytesmo>=0.18.0",
     "pytz>=2026.1.post1",
+    "qa4sm-preprocessing",
+    "qa4sm-reader",
     "rioxarray>=0.22.0",
     "scipy>=1.17.1",
     "smap-io>=0.8",
     "xarray>=2026.2.0",
 ]
+
+[tool.uv.sources]
+qa4sm-preprocessing = { path = "qa4sm-preprocessing", editable = true }
+qa4sm-reader = { path = "qa4sm-reader", editable = true }
 
 [project.scripts]
 qa4sm-validate = "validator.cli:main"
