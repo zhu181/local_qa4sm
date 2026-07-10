@@ -1,12 +1,11 @@
 import numpy as np
-import pytest
 
 from validator.filters import (
     check_normalized_bits_array,
     get_used_variables,
     smos_exclude_bitmask,
 )
-from validator.models import DataFilter, Dataset, DataVariable
+from validator.models import DataFilter, DataVariable
 
 
 class TestSmosExcludeBitmask:
@@ -46,7 +45,10 @@ class TestCheckNormalizedBitsArray:
 class TestGetUsedVariables:
     def make_var(self, name="soil_moisture"):
         return DataVariable(
-            id=1, short_name=name, pretty_name=name, help_text="",
+            id=1,
+            short_name=name,
+            pretty_name=name,
+            help_text="",
         )
 
     def make_filter(self, name):
@@ -79,7 +81,8 @@ class TestGetUsedVariables:
         var = self.make_var()
         result = get_used_variables(
             [self.make_filter("FIL_ISMN_GOOD"), self.make_filter("FIL_SMOS_UNFROZEN")],
-            None, var,
+            None,
+            var,
         )
         assert "soil_moisture_flag" in result
         assert "Scene_Flags" in result
@@ -112,10 +115,15 @@ class TestGetUsedVariables:
     def test_smosl3_science_flags(self):
         var = self.make_var()
         for filter_name in [
-            "FIL_SMOSL3_STRONG_TOPO_MANDATORY", "FIL_SMOSL3_MODERATE_TOPO",
-            "FIL_SMOSL3_ICE_MANDATORY", "FIL_SMOSL3_FROZEN",
-            "FIL_SMOSL3_URBAN_LOW", "FIL_SMOSL3_URBAN_HIGH",
-            "FIL_SMOSL3_WATER", "FIL_SMOSL3_EXTERNAL", "FIL_SMOSL3_TAU_FO",
+            "FIL_SMOSL3_STRONG_TOPO_MANDATORY",
+            "FIL_SMOSL3_MODERATE_TOPO",
+            "FIL_SMOSL3_ICE_MANDATORY",
+            "FIL_SMOSL3_FROZEN",
+            "FIL_SMOSL3_URBAN_LOW",
+            "FIL_SMOSL3_URBAN_HIGH",
+            "FIL_SMOSL3_WATER",
+            "FIL_SMOSL3_EXTERNAL",
+            "FIL_SMOSL3_TAU_FO",
         ]:
             result = get_used_variables([self.make_filter(filter_name)], None, var)
             assert "Science_Flags" in result, f"{filter_name} should add Science_Flags"

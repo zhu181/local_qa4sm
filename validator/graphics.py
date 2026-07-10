@@ -1,35 +1,30 @@
+import base64
+import logging
+import os
 import warnings
+from io import BytesIO
+from os import path, remove
+from pathlib import Path
+from shutil import rmtree
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import matplotlib.pyplot as plt
 import pandas as pd
-
-
-import logging
-from os import path, remove
-from shutil import rmtree
-from zipfile import ZipFile, ZIP_DEFLATED
-
-from qa4sm_reader.plot_all import plot_all, get_img_stats
-from qa4sm_reader.comparing import QA4SMComparison, ComparisonError, SpatialExtentError
-
-from typing import List, Tuple, Dict, Set
-from pathlib import Path
-
+from parse import parse
+from qa4sm_reader.comparing import ComparisonError, QA4SMComparison, SpatialExtentError
+from qa4sm_reader.plot_all import get_img_stats, plot_all
 
 from validator.globals import (
-    OUTPUT_FOLDER,
-    METRICS as READER_METRICS,
-    METRIC_TEMPLATE,
-    TC_METRICS,
-    TC_METRIC_TEMPLATE,
     DEFAULT_TSW,
+    METRIC_TEMPLATE,
+    OUTPUT_FOLDER,
     STABILITY_METRICS,
+    TC_METRIC_TEMPLATE,
+    TC_METRICS,
 )
-import os
-from io import BytesIO
-import base64
-from parse import parse
-
+from validator.globals import (
+    METRICS as READER_METRICS,
+)
 from validator.models import ValidationRun
 
 plt.switch_backend("agg")
@@ -38,8 +33,8 @@ __logger = logging.getLogger(__name__)
 
 
 def generate_all_graphs(
-    validation_run:ValidationRun,
-    temporal_sub_windows: List[str],
+    validation_run: ValidationRun,
+    temporal_sub_windows: list[str],
     outfolder: str,
     save_metadata="threshold",
 ):
@@ -64,7 +59,7 @@ def generate_all_graphs(
         return None
 
     zipfilename = path.join(outfolder, "graphs.zip")
-    __logger.debug("Trying to create zipfile {}".format(zipfilename))
+    __logger.debug(f"Trying to create zipfile {zipfilename}")
 
     # Ensure we pass an absolute path to the plotting routines. The
     # `validation_run.output_file` may be stored relative to OUTPUT_FOLDER.
@@ -83,10 +78,7 @@ def generate_all_graphs(
 
     plot_all_output_dict = sort_filenames_to_filetypes((fnb, fnm, fcsv, fncb))
     flattened_list = [
-        item
-        for inner_dict in plot_all_output_dict.values()
-        for lst in inner_dict.values()
-        for item in lst
+        item for inner_dict in plot_all_output_dict.values() for lst in inner_dict.values() for item in lst
     ]
     root_dir = os.path.dirname(os.path.commonprefix(flattened_list))
 
@@ -111,7 +103,7 @@ def generate_all_graphs(
     )
 
 
-def get_dataset_combis_and_metrics_from_files(validation_run:ValidationRun):
+def get_dataset_combis_and_metrics_from_files(validation_run: ValidationRun):
     """
     Go through plots of validation run and detect the dataset names and ids.
     Create combinations of id-REF_and_id-SAT to show the plots on the results
@@ -150,9 +142,9 @@ def get_dataset_combis_and_metrics_from_files(validation_run:ValidationRun):
         bulk_prefix += "bulk_"
 
     if validation_run.stability_metrics:
-        METRICS = {**READER_METRICS, **STABILITY_METRICS}
+        metrics_lookup = {**READER_METRICS, **STABILITY_METRICS}
     else:
-        METRICS = READER_METRICS
+        metrics_lookup = READER_METRICS
 
     # if validation_run
     for root, dirs, files in os.walk(run_dir):
@@ -160,21 +152,16 @@ def get_dataset_combis_and_metrics_from_files(validation_run:ValidationRun):
             if not f.endswith(".png"):
                 continue
 
-            for pair_metric in METRICS.keys():
+            for pair_metric in metrics_lookup.keys():
                 if pair_metric == "n_obs":
-                    metrics["n_obs"] = METRICS["n_obs"]
+                    metrics["n_obs"] = metrics_lookup["n_obs"]
                     continue
 
                 if pair_metric == "status":
-                    metrics["status"] = METRICS["status"]
+                    metrics["status"] = metrics_lookup["status"]
                     continue
 
-                template = (
-                    "".join(
-                        [metric_template, METRIC_TEMPLATE[1].format(metric=pair_metric)]
-                    )
-                    + ".png"
-                )
+                template = "".join([metric_template, METRIC_TEMPLATE[1].format(metric=pair_metric)]) + ".png"
                 parsed = parse(template, f)
 
                 if parsed is None:
@@ -187,10 +174,10 @@ def get_dataset_combis_and_metrics_from_files(validation_run:ValidationRun):
                         ref0_config = True
 
                     if pair_metric not in metrics.keys():
-                        metrics[pair_metric] = METRICS[pair_metric]
+                        metrics[pair_metric] = metrics_lookup[pair_metric]
 
-                    pair = "{}_and_{}".format(ref, ds)
-                    pretty_pair = "{} and {}".format(ref, ds)
+                    pair = f"{ref}_and_{ds}"
+                    pretty_pair = f"{ref} and {ds}"
                     if pair not in pairs.keys():
                         pairs[pair] = pretty_pair  # pretty name
 
@@ -221,8 +208,8 @@ def get_dataset_combis_and_metrics_from_files(validation_run:ValidationRun):
                     if metric not in metrics.keys():
                         metrics[metric] = f"{TC_METRICS[tcol_metric]} for {ds_met}"
 
-                    triple = "{}_and_{}_and_{}".format(ref, ds, ds2)
-                    pretty_triple = "{} and {} and {}".format(ref, ds, ds2)
+                    triple = f"{ref}_and_{ds}_and_{ds2}"
+                    pretty_triple = f"{ref} and {ds} and {ds2}"
                     if triple not in triples.keys():
                         triples[triple] = pretty_triple
 
@@ -235,7 +222,7 @@ def get_dataset_combis_and_metrics_from_files(validation_run:ValidationRun):
     return pairs, triples, metrics, ref0_config
 
 
-def get_inspection_table(validation_run:ValidationRun):
+def get_inspection_table(validation_run: ValidationRun):
     """
     Generate the quick inspection table with the summary statistics of the results
 
@@ -288,9 +275,7 @@ def get_inspection_table(validation_run:ValidationRun):
         return None
 
 
-def generate_comparison(
-    validation_runs: list, extent: tuple = None, get_intersection: bool = True
-) -> tuple:
+def generate_comparison(validation_runs: list, extent: tuple = None, get_intersection: bool = True) -> tuple:
     """Initializes a QA4SMComparison class"""
     outfiles = [validation_run.output_file for validation_run in validation_runs]
     # handle single validation or multiple validations
@@ -301,9 +286,7 @@ def generate_comparison(
         for file in outfiles:
             outpaths.append(file.path)
 
-    comparison = QA4SMComparison(
-        paths=outpaths, extent=extent, get_intersection=get_intersection
-    )
+    comparison = QA4SMComparison(paths=outpaths, extent=extent, get_intersection=get_intersection)
 
     return comparison
 
@@ -344,7 +327,7 @@ def comparison_table(
     return table
 
 
-def encoded_comparisonPlots(
+def encoded_comparison_plots(
     validation_runs: list,
     plot_type: str,
     metric: str,
@@ -458,7 +441,7 @@ def collect_statitics_files(dir: str) -> None:
     None
     """
     zipfilename = path.join(dir, "statistics.zip")
-    __logger.debug("Trying to create zipfile {}".format(zipfilename))
+    __logger.debug(f"Trying to create zipfile {zipfilename}")
 
     with ZipFile(zipfilename, "w", ZIP_DEFLATED) as myzip:
         for root, dirs, files in os.walk(dir):
@@ -468,7 +451,7 @@ def collect_statitics_files(dir: str) -> None:
                     myzip.write(path.join(root, f), arcname=arcname)
 
 
-def clean_output_folder(dir: str, to_be_deleted: List[str]) -> None:
+def clean_output_folder(dir: str, to_be_deleted: list[str]) -> None:
     """
     Clean a specified directory of given elements.
 
@@ -496,8 +479,8 @@ def clean_output_folder(dir: str, to_be_deleted: List[str]) -> None:
 
 
 def sort_filenames_to_filetypes(
-    plot_output: Tuple[List[Path]],
-) -> Dict[str, Dict[str, List[Path]]]:
+    plot_output: tuple[list[Path]],
+) -> dict[str, dict[str, list[Path]]]:
     """
     Sorts the files, that are the output of the `qa4sm_reader.plot_all.plot_all()` into a dictionary. \
         The four keys correspond to the four lists of the `qa4sm_reader.plot_all.plot_all()` output,\
@@ -525,19 +508,16 @@ def sort_filenames_to_filetypes(
 
     _out_dict_lut = {0: "fnb", 1: "fnm", 2: "fcsv", 3: "fncb"}
 
-    for l, lst in enumerate(plot_output):
+    for idx, lst in enumerate(plot_output):
         lst_suffixes = list(set([el.suffix for el in lst]))
-        _out_dict[_out_dict_lut[l]] = {
-            suffix.lstrip("."): [ffile for ffile in lst if ffile.suffix == suffix]
-            for suffix in lst_suffixes
+        _out_dict[_out_dict_lut[idx]] = {
+            suffix.lstrip("."): [ffile for ffile in lst if ffile.suffix == suffix] for suffix in lst_suffixes
         }
 
     return _out_dict
 
 
-def files_to_zip(
-    plot_dict: Dict[str, Dict[str, List[Path]]], filetype: str
-) -> Set[Path]:
+def files_to_zip(plot_dict: dict[str, dict[str, list[Path]]], filetype: str) -> set[Path]:
     """
     Collects the files of a given filetype from the plot_dict and returns them as a set.
 
@@ -558,9 +538,7 @@ def files_to_zip(
 
     try:
         _files += plot_dict["fncb"][filetype]
-    except (
-        KeyError
-    ) as e:  # if there are no comparison boxplots the 'fncb' key will not be present
+    except KeyError as e:  # if there are no comparison boxplots the 'fncb' key will not be present
         warnings.warn(f"KeyError: {e}. No comparison boxplots found. Skipping...")
     finally:
         _files = set(_files)

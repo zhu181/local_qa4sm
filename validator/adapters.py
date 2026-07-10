@@ -1,9 +1,10 @@
 import warnings
+
 import numpy as np
-from scipy.stats import theilslopes
 from pytesmo.validation_framework.metric_calculators_adapters import (
     SubsetsMetricsAdapter,
 )
+from scipy.stats import theilslopes
 
 
 class StabilityMetricsAdapter(SubsetsMetricsAdapter):
@@ -109,9 +110,7 @@ class StabilityMetricsAdapter(SubsetsMetricsAdapter):
                 # Group the values by the metric name (e.g., 'R', 'BIAS', 'urmsd')
                 if metric_name not in metrics_by_type:
                     metrics_by_type[metric_name] = []
-                metrics_by_type[metric_name].append(
-                    (int(year), value)
-                )  # Store year and value
+                metrics_by_type[metric_name].append((int(year), value))  # Store year and value
 
         # Now calculate Theil-Sen slope for each supported metric type
         for metric_name, entries in metrics_by_type.items():
@@ -134,14 +133,10 @@ class StabilityMetricsAdapter(SubsetsMetricsAdapter):
                 slope_per_decade = slope * 10
 
                 # Store the slope results for this metric type
-                stability_results[f"bulk|slope{metric_name}"] = np.array(
-                    [slope_per_decade]
-                )
+                stability_results[f"bulk|slope{metric_name}"] = np.array([slope_per_decade])
 
             except Exception as e:
                 stability_results[f"bulk|slope{metric_name}"] = np.array([np.nan])
-                warnings.warn(
-                    f"Failed to calculate Theil-Sen slope for {metric_name}: {e}"
-                )
+                warnings.warn(f"Failed to calculate Theil-Sen slope for {metric_name}: {e}")
 
         return stability_results

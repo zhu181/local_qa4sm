@@ -18,7 +18,7 @@ def _combine_rfi_columns(row):
 
 
 """
-Bitmask filter for SMOS, you can only exclude data on set bits (not on unset 
+Bitmask filter for SMOS, you can only exclude data on set bits (not on unset
 bits)
 """
 

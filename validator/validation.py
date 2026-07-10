@@ -5,7 +5,7 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
-from typing import Dict, List, Tuple, Union
+from typing import Any
 
 import netCDF4
 import pandas as pd
@@ -88,7 +88,7 @@ def _get_actual_time_range(val_run: ValidationRun, dataset_version: DatasetVersi
     return [actual_start, actual_end]
 
 
-def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str, dict]:
+def _get_spatial_reference_reader(val_run: ValidationRun) -> tuple[Any, str, dict]:
     ref_reader = create_reader(
         val_run.spatial_reference_configuration.dataset,
         val_run.spatial_reference_configuration.version,
@@ -100,7 +100,8 @@ def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str
         val_run.spatial_reference_configuration.version,
     )
 
-    # we do the dance with the filtering below because filter may actually change the original reader, see ismn network selection
+    # we do the dance with the filtering below because filter may actually
+    # change the original reader, see ismn network selection
     filtered_reader, read_name, read_kwargs = setup_filtering(
         reader=time_adapted_ref_reader,
         filters=list(val_run.spatial_reference_configuration.filters),
@@ -260,7 +261,10 @@ def save_validation_config(validation_run: ValidationRun):
                     validation_run.max_lon,
                 ]
             ):
-                ds.val_spatial_subset = f"[{validation_run.min_lat}, {validation_run.min_lon}, {validation_run.max_lat}, {validation_run.max_lon}]"
+                ds.val_spatial_subset = (
+                    f"[{validation_run.min_lat}, {validation_run.min_lon}, "
+                    f"{validation_run.max_lat}, {validation_run.max_lon}]"
+                )
 
     except Exception:
         __logger.exception("Validation configuration could not be stored.")
@@ -378,9 +382,9 @@ def create_pytesmo_validation(validation_run: ValidationRun):
             and dataset_config.id == validation_run.spatial_reference_configuration.id
         )
         dataset_name = (
-            "0-{}".format(dataset_config.dataset.short_name)
+            f"0-{dataset_config.dataset.short_name}"
             if is_spatial_ref
-            else "{}-{}".format(ds_num, dataset_config.dataset.short_name)
+            else f"{ds_num}-{dataset_config.dataset.short_name}"
         )
         if not is_spatial_ref:
             ds_num += 1
@@ -460,7 +464,7 @@ def create_pytesmo_validation(validation_run: ValidationRun):
 def num_gpis_from_job(job):
     try:
         num_gpis = len(job[0])
-    except:
+    except Exception:
         num_gpis = 1
 
     return num_gpis
@@ -472,9 +476,8 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
     numgpis = num_gpis_from_job(job)
     for attempt in range(max_retries + 1):
         __logger.debug(
-            "Executing job {} from validation {}, # of gpis: {}, attempt {}/{}".format(
-                task_id, validation_run.id, numgpis, attempt + 1, max_retries + 1
-            )
+            f"Executing job {task_id} from validation {validation_run.id}, "
+            f"# of gpis: {numgpis}, attempt {attempt + 1}/{max_retries + 1}"
         )
         start_time = datetime.now(tzlocal())
         try:
@@ -490,24 +493,22 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
             duration = end_time - start_time
             duration = (duration.days * 86400) + duration.seconds
             __logger.debug(
-                "Finished job {} from validation {}, took {} seconds for {} gpis".format(
-                    task_id, validation_run.id, duration, numgpis
-                )
+                f"Finished job {task_id} from validation {validation_run.id}, "
+                f"took {duration} seconds for {numgpis} gpis"
             )
             return result
         except Exception as e:
             # Handle non-retriable KeyError cases (missing DataFrame columns)
             if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
                 __logger.warning(
-                    "Job {} from validation {} hit non-retriable key error {}. "
-                    "Marking job as empty result and continuing.".format(task_id, validation_run.id, e)
+                    f"Job {task_id} from validation {validation_run.id} hit non-retriable key error {e}. "
+                    "Marking job as empty result and continuing."
                 )
                 return {}
             # Handle pytesmo TripleCollocationMetrics bug with empty DataFrames
             if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
                 __logger.warning(
-                    "Job %s hit pytesmo tcol bug (empty DataFrame for dummy result). "
-                    "Returning empty result.",
+                    "Job %s hit pytesmo tcol bug (empty DataFrame for dummy result). Returning empty result.",
                     task_id,
                 )
                 return {}
@@ -528,7 +529,7 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
 
 def check_and_store_results(job_id, results, save_path):
     if len(results) < 1:
-        __logger.warning("Potentially problematic job: {} - no results".format(job_id))
+        __logger.warning(f"Potentially problematic job: {job_id} - no results")
         return
 
     try:
@@ -577,7 +578,7 @@ def untrack_validation_task(task_id):
         validation_task = ValidationTask.objects.get(task_id=task_id)
         validation_task.delete()
     except ValidationTask.DoesNotExist:
-        __logger.debug("Task {} already deleted from db.".format(task_id))
+        __logger.debug(f"Task {task_id} already deleted from db.")
 
 
 def _count_job_status(results: dict, ngpis: int) -> tuple[int, int]:
@@ -668,7 +669,7 @@ def _determine_max_workers(jobs, ref_reader):
 
 
 def run_validation(validation_run: ValidationRun):
-    __logger.info("Starting validation: {}".format(validation_run.id))
+    __logger.info(f"Starting validation: {validation_run.id}")
     validation_aborted = False
 
     try:
@@ -683,10 +684,10 @@ def run_validation(validation_run: ValidationRun):
             dataset_config=validation_run.spatial_reference_configuration,
         )
         validation_run.total_points = total_points
-        __logger.debug("Jobs to run: {}".format([job[:-1] for job in jobs]))
+        __logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
 
         max_workers = _determine_max_workers(jobs, ref_reader)
-        __logger.info("Running validation {} with {} parallel workers.".format(validation_run.id, max_workers))
+        __logger.info(f"Running validation {validation_run.id} with {max_workers} parallel workers.")
         total_jobs = len(jobs)
         run_started_at = time.monotonic()
         last_heartbeat_at = run_started_at
@@ -726,7 +727,7 @@ def run_validation(validation_run: ValidationRun):
                 if not done:
                     if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
                         validation_aborted = True
-                        __logger.debug("Validation {} got cancelled while waiting.".format(validation_run.id))
+                        __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
                     continue
 
                 for future in done:
@@ -767,18 +768,16 @@ def run_validation(validation_run: ValidationRun):
             _post_process_run(validation_run, run_dir, last_results)
 
     except Exception:
-        __logger.exception("Unexpected exception during validation {}:".format(validation_run))
+        __logger.exception(f"Unexpected exception during validation {validation_run}:")
 
     finally:
         validation_run.end_time = datetime.now(tzlocal())
         __logger.info(
-            "Validation finished: {}. Jobs: {}, Errors: {}, OK: {}, End time: {} ".format(
-                validation_run,
-                validation_run.total_points,
-                validation_run.error_points,
-                validation_run.ok_points,
-                validation_run.end_time,
-            )
+            f"Validation finished: {validation_run}. "
+            f"Jobs: {validation_run.total_points}, "
+            f"Errors: {validation_run.error_points}, "
+            f"OK: {validation_run.ok_points}, "
+            f"End time: {validation_run.end_time}"
         )
 
     return validation_run
@@ -839,7 +838,7 @@ def _pytesmo_to_qa4sm_results(results: dict) -> dict:
     return qa4sm_res
 
 
-def get_period(val_run: ValidationRun) -> Union[None, List[str]]:
+def get_period(val_run: ValidationRun) -> None | list[str]:
     """
     Extract the validation period from the validation run object.
 
@@ -851,10 +850,12 @@ def get_period(val_run: ValidationRun) -> Union[None, List[str]]:
     Returns
     -------
     Union[None, List[str]]
-        The validation period as a list of two strings, the start and end date, respectively. If no period is defined, None is returned.
+        The validation period as a list of two strings, the start and end date,
+        respectively. If no period is defined, None is returned.
     """
     if val_run.interval_from is not None and val_run.interval_to is not None:
-        # while pytesmo can't deal with timezones, normalise the validation period to utc; can be removed once pytesmo can do timezones
+        # while pytesmo can't deal with timezones, normalise the validation
+        # period to utc; can be removed once pytesmo can do timezones
         startdate = val_run.interval_from.astimezone(UTC).replace(tzinfo=None)
         enddate = val_run.interval_to.astimezone(UTC).replace(tzinfo=None)
         return [startdate, enddate]
@@ -862,10 +863,11 @@ def get_period(val_run: ValidationRun) -> Union[None, List[str]]:
 
 
 def define_tsw_metrics(
-    val_run: ValidationRun, period: List
-) -> Dict[str, Union[TemporalSubWindowsCreator, Dict[str, TsDistributor], None]]:
+    val_run: ValidationRun, period: list
+) -> dict[str, TemporalSubWindowsCreator | dict[str, TsDistributor] | None]:
     """
-    Extract the temporal sub-window metrics settings from the validation run and instantiate the corresponding objects.
+    Extract the temporal sub-window metrics settings from the validation run
+    and instantiate the corresponding objects.
 
     Parameters
     ----------
@@ -877,7 +879,8 @@ def define_tsw_metrics(
     Returns
     -------
     Dict[str, Union[TemporalSubWindowsCreator, Dict[str, TsDistributor], None]]
-        A dictionary containing the temporal sub-window instance and the custom temporal sub-windows, if applicable. Otherwise, filled with None.
+        A dictionary containing the temporal sub-window instance and the custom
+        temporal sub-windows, if applicable. Otherwise, filled with None.
     """
     temp_sub_wdw_instance = None
 

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MethodType
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 from validator.models import (
@@ -29,7 +29,7 @@ class OutputFile:
     name: str = ""
 
 
-def _parse_datetime(value: Any) -> Optional[datetime]:
+def _parse_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
     if isinstance(value, datetime):
@@ -136,7 +136,7 @@ def _parse_dataset_configuration(payload: dict[str, Any], validation: Validation
     return config
 
 
-def _resolve_config_ref(raw_ref: Any, config_by_id: dict[int, DatasetConfiguration]) -> Optional[DatasetConfiguration]:
+def _resolve_config_ref(raw_ref: Any, config_by_id: dict[int, DatasetConfiguration]) -> DatasetConfiguration | None:
     if raw_ref is None:
         return None
     if isinstance(raw_ref, int):
@@ -217,7 +217,7 @@ def parse_validation_run_config(payload: dict[str, Any]) -> ValidationRun:
 def run_validation_from_json_file(json_file: str | Path) -> ValidationRun:
     from validator.validation import run_validation
 
-    with open(json_file, "r", encoding="utf-8") as f:
+    with open(json_file, encoding="utf-8") as f:
         payload = json.load(f)
     val_run = parse_validation_run_config(payload)
     return run_validation(val_run)

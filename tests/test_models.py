@@ -3,10 +3,10 @@ from uuid import uuid4
 
 from validator.models import (
     DataFilter,
-    DataVariable,
     Dataset,
     DatasetConfiguration,
     DatasetVersion,
+    DataVariable,
     ParametrisedFilter,
     ValidationRun,
     ValidationTask,
@@ -39,31 +39,51 @@ class TestDataVariable:
 class TestDataset:
     def test_minimal(self):
         d = Dataset(
-            id=1, short_name="TEST", pretty_name="Test",
-            help_text="", detailed_description="", source_reference="", citation="",
+            id=1,
+            short_name="TEST",
+            pretty_name="Test",
+            help_text="",
+            detailed_description="",
+            source_reference="",
+            citation="",
         )
         assert d.short_name == "TEST"
         assert d.reader is None
 
     def test_resolution_in_m_default(self):
         d = Dataset(
-            id=1, short_name="TEST", pretty_name="Test",
-            help_text="", detailed_description="", source_reference="", citation="",
+            id=1,
+            short_name="TEST",
+            pretty_name="Test",
+            help_text="",
+            detailed_description="",
+            source_reference="",
+            citation="",
         )
         assert d.resolution_in_m == 30e3
 
     def test_resolution_in_m_km(self):
         d = Dataset(
-            id=1, short_name="TEST", pretty_name="Test",
-            help_text="", detailed_description="", source_reference="", citation="",
+            id=1,
+            short_name="TEST",
+            pretty_name="Test",
+            help_text="",
+            detailed_description="",
+            source_reference="",
+            citation="",
         )
         d.resolution = {"value": 25, "unit": "km"}
         assert d.resolution_in_m == 25e3
 
     def test_resolution_in_m_deg(self):
         d = Dataset(
-            id=1, short_name="TEST", pretty_name="Test",
-            help_text="", detailed_description="", source_reference="", citation="",
+            id=1,
+            short_name="TEST",
+            pretty_name="Test",
+            help_text="",
+            detailed_description="",
+            source_reference="",
+            citation="",
         )
         d.resolution = {"value": 0.25, "unit": "deg"}
         assert d.resolution_in_m == 0.25 * 100 * 1e3
@@ -98,7 +118,8 @@ class TestValidationRun:
 
     def test_with_interval(self):
         run = ValidationRun(
-            id="test-2", name_tag="test",
+            id="test-2",
+            name_tag="test",
             interval_from=datetime(2020, 1, 1),
             interval_to=datetime(2020, 12, 31),
         )
@@ -118,8 +139,13 @@ class TestDatasetConfiguration:
 
     def make_dataset(self):
         return Dataset(
-            id=1, short_name="TEST", pretty_name="Test",
-            help_text="", detailed_description="", source_reference="", citation="",
+            id=1,
+            short_name="TEST",
+            pretty_name="Test",
+            help_text="",
+            detailed_description="",
+            source_reference="",
+            citation="",
         )
 
     def test_minimal(self):
@@ -149,11 +175,13 @@ class TestValidationTask:
 
     def test_does_not_exist(self):
         import pytest
+
         with pytest.raises(ValidationTask.DoesNotExist):
             ValidationTask.objects.get(task_id="nonexistent")
 
     def test_save_requires_task_id(self):
         import pytest
+
         task = ValidationTask()
         with pytest.raises(ValueError, match="task_id must be set"):
             task.save()

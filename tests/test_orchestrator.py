@@ -5,10 +5,9 @@ import pytest
 
 from validator.orchestrator import (
     ValidationRun,
-    parse_validation_run_config,
     _parse_datetime,
+    parse_validation_run_config,
 )
-
 
 SAMPLE_CONFIG = {
     "validation_run": {

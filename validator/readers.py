@@ -11,7 +11,7 @@ from qa4sm_preprocessing.reading import (
     GriddedNcContiguousRaggedTs,
     GriddedNcOrthoMultiTs,
 )
-from smap_io.interface import ReaderWithExtension_SMAP, SMAPL3_V9Reader, SMAPTs
+from smap_io.interface import SMAPL3_V9Reader, SMAPTs
 
 from validator import globals
 from validator.models import Dataset

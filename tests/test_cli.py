@@ -72,6 +72,7 @@ def test_dry_run_broken_json():
 
 def test_nonexistent_config():
     import pytest
+
     with pytest.raises(SystemExit) as exc:
         main(["/nonexistent/path.json", "--dry-run"])
     assert exc.value.code == 2

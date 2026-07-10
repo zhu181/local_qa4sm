@@ -44,9 +44,7 @@ def parse_dataset_keys_from_filename(filename: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Transcribe pytesmo validation results to QA4SM NetCDF format."
-    )
+    parser = argparse.ArgumentParser(description="Transcribe pytesmo validation results to QA4SM NetCDF format.")
     parser.add_argument(
         "input",
         type=str,
@@ -56,8 +54,7 @@ def main():
         "--output-dir",
         type=str,
         default=None,
-        help="Directory to write the transcribed NetCDF file. "
-        "Defaults to the same directory as the input file.",
+        help="Directory to write the transcribed NetCDF file. Defaults to the same directory as the input file.",
     )
     parser.add_argument(
         "--keep-pytesmo",
@@ -82,8 +79,7 @@ def main():
         nargs=2,
         metavar=("START_YEAR", "END_YEAR"),
         default=None,
-        help="Create stability temporal sub-windows for the given year range. "
-        "e.g. --stability 2016 2021",
+        help="Create stability temporal sub-windows for the given year range. e.g. --stability 2016 2021",
     )
 
     args = parser.parse_args()
