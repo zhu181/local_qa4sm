@@ -504,14 +504,13 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
                 return {}
             if attempt < max_retries:
                 __logger.warning(
-                    "Job {} from validation {} failed on attempt {}/{}: {}. Retrying in {} seconds.".format(
-                        task_id,
-                        validation_run.id,
-                        attempt + 1,
-                        max_retries + 1,
-                        e,
-                        retry_delay_seconds,
-                    )
+                    "Job %s failed on attempt %s/%s (%s: %s). Retrying in %ss.",
+                    task_id,
+                    attempt + 1,
+                    max_retries + 1,
+                    type(e).__name__,
+                    str(e)[:120],
+                    retry_delay_seconds,
                 )
                 time.sleep(retry_delay_seconds)
                 continue
@@ -733,7 +732,12 @@ def run_validation(validation_run: ValidationRun):
 
                     except Exception as e:
                         validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                        __logger.exception("Job {} failed: {}".format(task_id, e))
+                        __logger.error(
+                            "Job %s failed after all retries (%s: %s).",
+                            task_id,
+                            type(e).__name__,
+                            str(e)[:120],
+                        )
                         if validation_task_cancelled(task_id):
                             validation_aborted = True
                     finally:

@@ -68,6 +68,7 @@ class _ValidationNoiseFilter(logging.Filter):
 			"warn_small_sample": 0,
 			"warn_constant_input": 0,
 			"warn_no_data_dataset": 0,
+			"pytesmo_tcol_bug": 0,
 		}
 
 	def filter(self, record: logging.LogRecord) -> bool:
@@ -90,6 +91,9 @@ class _ValidationNoiseFilter(logging.Filter):
 		if "No data for dataset" in msg:
 			self._counts["warn_no_data_dataset"] += 1
 			return self._counts["warn_no_data_dataset"] <= self.keep_first
+		if "list.remove(x): x not in list" in msg:
+			self._counts["pytesmo_tcol_bug"] += 1
+			return self._counts["pytesmo_tcol_bug"] <= self.keep_first
 		return True
 
 	def emit_summary(self) -> None:
@@ -113,6 +117,7 @@ class _ValidationNoiseFilter(logging.Filter):
 			("warn_small_sample", "Small sample warnings"),
 			("warn_constant_input", "Constant input warnings"),
 			("warn_no_data_dataset", "No data for dataset warnings"),
+			("pytesmo_tcol_bug", "Pytesmo tcol dummy result errors"),
 		]:
 			suppressed = max(0, self._counts[key] - self.keep_first)
 			if suppressed > 0:
@@ -187,6 +192,9 @@ def _configure_logging(log_level: str, log_file: str | None = None) -> _Validati
 		file_handler.setFormatter(formatter)
 		file_handler.addFilter(noise_filter)
 		root_logger.addHandler(file_handler)
+
+	# Suppress verbose pytesmo internal logging (e.g. full GPI metadata dumps).
+	logging.getLogger("pytesmo").setLevel(logging.CRITICAL)
 
 	# Keep warnings enabled, but limit duplicates via logging filter above.
 	warnings.simplefilter("default")
