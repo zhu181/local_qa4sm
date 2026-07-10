@@ -496,10 +496,19 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
             )
             return result
         except Exception as e:
+            # Handle non-retriable KeyError cases (missing DataFrame columns)
             if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
                 __logger.warning(
                     "Job {} from validation {} hit non-retriable key error {}. "
                     "Marking job as empty result and continuing.".format(task_id, validation_run.id, e)
+                )
+                return {}
+            # Handle pytesmo TripleCollocationMetrics bug with empty DataFrames
+            if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
+                __logger.warning(
+                    "Job %s hit pytesmo tcol bug (empty DataFrame for dummy result). "
+                    "Returning empty result.",
+                    task_id,
                 )
                 return {}
             if attempt < max_retries:
