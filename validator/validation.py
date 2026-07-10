@@ -624,6 +624,9 @@ def _post_process_run(validation_run, run_dir, results):
     _outname, outname_zarr = transcriber.build_outname(run_dir, results.keys())
     transcriber.output_file_name = str(_outname)
     transcriber.output_zarr_name = str(outname_zarr)
+    # Initialize transcribed_dataset before writing — write_to_netcdf relies on
+    # self.transcribed_dataset which is only populated by get_transcribed_dataset()
+    transcriber.get_transcribed_dataset()
     transcriber.write_to_netcdf(transcriber.output_file_name)
     save_validation_config(validation_run)
     transcriber.compress(path=transcriber.output_file_name, compression="zlib", complevel=9)
