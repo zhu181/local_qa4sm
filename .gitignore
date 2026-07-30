@@ -19,6 +19,7 @@ data/
 
 *.code-workspace
 .vscode/
+.trae/
 
 # Sub-projects have their own git history; install via pip/uv from their own repos
 qa4sm-preprocessing/

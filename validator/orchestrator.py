@@ -220,7 +220,7 @@ def run_validation_from_json_file(json_file: str | Path) -> ValidationRun:
     with open(json_file, encoding="utf-8") as f:
         payload = json.load(f)
     val_run = parse_validation_run_config(payload)
-    return run_validation(val_run)
+    return run_validation(val_run, val_run_payload=payload)
 
 
 def run_validation_from_json_string(json_content: str) -> ValidationRun:
@@ -228,4 +228,4 @@ def run_validation_from_json_string(json_content: str) -> ValidationRun:
 
     payload = json.loads(json_content)
     val_run = parse_validation_run_config(payload)
-    return run_validation(val_run)
+    return run_validation(val_run, val_run_payload=payload)

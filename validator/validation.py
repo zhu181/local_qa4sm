@@ -1,9 +1,11 @@
 import ast
 import logging
 import os
+import sys
+import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Any
 
@@ -52,12 +54,29 @@ from validator.globals import (
     TEMPORAL_SUB_WINDOW_SEPARATOR,
     TEMPORAL_SUB_WINDOWS,
 )
+from validator.gpu_backend import get_gpu_backend
+from validator.gpu_metrics import GPUBatchedValidation
 from validator.graphics import generate_all_graphs
 from validator.models import DatasetVersion, ValidationRun, ValidationTask
 from validator.readers import adapt_timestamp, create_reader
+from validator.ts_cache import CachedReader, get_ts_cache
 from validator.utils import first_file_in, mkdir_if_not_exists
 
 __logger = logging.getLogger(__name__)
+
+
+def _format_eta(elapsed_seconds: int, completed: int, total: int) -> str:
+    """Format estimated time remaining as HH:MM:SS."""
+    if completed <= 0 or total <= 0:
+        return "N/A"
+    rate = completed / elapsed_seconds  # jobs per second
+    if rate <= 0:
+        return "N/A"
+    remaining_jobs = total - completed
+    eta_seconds = int(remaining_jobs / rate)
+    hours, remainder = divmod(eta_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def _get_actual_time_range(val_run: ValidationRun, dataset_version: DatasetVersion):
@@ -389,6 +408,9 @@ def create_pytesmo_validation(validation_run: ValidationRun):
         if not is_spatial_ref:
             ds_num += 1
 
+        if get_ts_cache().max_size_bytes > 0:
+            reader = CachedReader(reader)
+
         ds_list.append(
             (
                 dataset_name,
@@ -461,6 +483,122 @@ def create_pytesmo_validation(validation_run: ValidationRun):
     return val
 
 
+def _create_gpu_validation(validation_run: ValidationRun) -> GPUBatchedValidation:
+    """Create a GPUBatchedValidation configured the same way as create_pytesmo_validation."""
+    ds_list = []
+    ds_read_names = []
+    spatial_ref_name = None
+    scaling_ref_name = None
+    temporal_ref_name = None
+    spatial_ref_short_name = None
+    dataset_short_names: list[str] = []
+
+    ds_num = 1
+    for dataset_config in validation_run.dataset_configurations:
+        reader = create_reader(dataset_config.dataset, dataset_config.version)
+        time_adapted_reader = adapt_timestamp(reader, dataset_config.dataset, dataset_config.version)
+        reader, read_name, read_kwargs = setup_filtering(
+            reader=time_adapted_reader,
+            filters=list(dataset_config.filters),
+            param_filters=list(dataset_config.parametrised_filters),
+            dataset=dataset_config.dataset,
+            variable=dataset_config.variable,
+        )
+        reader = _apply_anomaly_adapter(reader, validation_run, dataset_config, read_name)
+
+        is_spatial_ref = (
+            validation_run.spatial_reference_configuration
+            and dataset_config.id == validation_run.spatial_reference_configuration.id
+        )
+        dataset_name = (
+            f"0-{dataset_config.dataset.short_name}"
+            if is_spatial_ref
+            else f"{ds_num}-{dataset_config.dataset.short_name}"
+        )
+        if not is_spatial_ref:
+            ds_num += 1
+
+        if get_ts_cache().max_size_bytes > 0:
+            reader = CachedReader(reader)
+
+        ds_list.append(
+            (
+                dataset_name,
+                {
+                    "class": reader,
+                    "columns": [dataset_config.variable.short_name],
+                    "kwargs": read_kwargs,
+                    "max_dist": dataset_config.dataset.resolution_in_m,
+                },
+            ),
+        )
+        ds_read_names.append((dataset_name, read_name))
+        dataset_short_names.append(dataset_config.dataset.short_name)
+
+        if is_spatial_ref:
+            spatial_ref_name = dataset_name
+            spatial_ref_short_name = dataset_config.dataset.short_name
+        if validation_run.scaling_ref and dataset_config.id == validation_run.scaling_ref.id:
+            scaling_ref_name = dataset_name
+        if (
+            validation_run.temporal_reference_configuration
+            and dataset_config.id == validation_run.temporal_reference_configuration.id
+        ):
+            temporal_ref_name = dataset_name
+
+    datasets = dict(ds_list)
+    ds_num = len(ds_list)
+    period = get_period(validation_run)
+
+    upscale_parms = _setup_upscaling(validation_run, datasets, spatial_ref_name)
+
+    datamanager = DataManager(
+        datasets,
+        ref_name=spatial_ref_name,
+        period=period,
+        read_ts_names=dict(ds_read_names),
+        upscale_parms=upscale_parms,
+    )
+    ds_names = get_dataset_names(datamanager.reference_name, datamanager.datasets, n=ds_num)
+
+    metadata_template = METADATA_TEMPLATE["ismn_ref" if spatial_ref_short_name == ISMN else "other_ref"]
+
+    tsw_dict = define_tsw_metrics(validation_run, period)
+    temp_sub_wdw_instance = tsw_dict["temp_sub_wdw_instance"]
+    temp_sub_wdws = tsw_dict["temp_sub_wdws"]
+
+    metric_calculators = _setup_metric_calculators(
+        ds_num,
+        ds_names,
+        validation_run,
+        metadata_template,
+        temp_sub_wdws,
+        temp_sub_wdw_instance,
+    )
+
+    scaling_method = (
+        None if validation_run.scaling_method == validation_run.NO_SCALING else validation_run.scaling_method
+    )
+    temporalwindow_size = validation_run.temporal_matching
+
+    gpu_val = GPUBatchedValidation(
+        datamanager=datamanager,
+        temporal_matcher=make_combined_temporal_matcher(pd.Timedelta(temporalwindow_size / 2, "h")),
+        temporal_ref=temporal_ref_name,
+        spatial_ref=spatial_ref_name,
+        scaling=scaling_method,
+        scaling_ref=scaling_ref_name,
+        metrics_calculators=metric_calculators,
+        ds_names=ds_names,
+        metadata_template=metadata_template,
+        calc_kendall=False,
+        tcol_enabled=validation_run.tcol,
+        bootstrap_tcol_cis=validation_run.bootstrap_tcol_cis,
+        dataset_short_names=dataset_short_names,
+    )
+    return gpu_val
+
+
 def num_gpis_from_job(job):
     try:
         num_gpis = len(job[0])
@@ -468,6 +606,112 @@ def num_gpis_from_job(job):
         num_gpis = 1
 
     return num_gpis
+
+
+_process_val = None
+_process_max_retries = 1
+_process_retry_delay_seconds = 1
+
+_process_gpu_val = None
+_process_gpu_max_retries = 1
+_process_gpu_retry_delay_seconds = 1
+
+
+def _init_process_worker(val_run_payload, max_retries, retry_delay_seconds):
+    global _process_val, _process_max_retries, _process_retry_delay_seconds
+    from validator.orchestrator import parse_validation_run_config
+
+    val_run = parse_validation_run_config(val_run_payload)
+    _process_val = create_pytesmo_validation(val_run)
+    _process_max_retries = max_retries
+    _process_retry_delay_seconds = retry_delay_seconds
+
+
+def _init_gpu_process_worker(val_run_payload, max_retries, retry_delay_seconds):
+    """Initialize a GPU validation worker process with its own readers and GPU backend."""
+    global _process_gpu_val, _process_gpu_max_retries, _process_gpu_retry_delay_seconds
+    from validator.orchestrator import parse_validation_run_config
+
+    val_run = parse_validation_run_config(val_run_payload)
+    _process_gpu_val = _create_gpu_validation(val_run)
+    _process_gpu_max_retries = max_retries
+    _process_gpu_retry_delay_seconds = retry_delay_seconds
+
+
+def _execute_gpu_job_in_process(job, task_id):
+    """Execute a GPU validation job in a worker process."""
+    if _process_gpu_val is None:
+        raise RuntimeError("GPU process worker not initialized.")
+    numgpis = num_gpis_from_job(job)
+    for attempt in range(_process_gpu_max_retries + 1):
+        start_time = datetime.now(tzlocal())
+        try:
+            result = _process_gpu_val.calc(
+                *job,
+                rename_cols=False,
+                only_with_reference=True,
+                handle_errors="ignore",
+            )
+            end_time = datetime.now(tzlocal())
+            duration = end_time - start_time
+            duration = (duration.days * 86400) + duration.seconds
+
+            # Periodically clear TS cache to prevent memory growth across jobs.
+            from validator.ts_cache import get_ts_cache
+            get_ts_cache().clear()
+
+            return {"_task_id": task_id, "_numgpis": numgpis, "_duration": duration, "_status": "ok", "result": result}
+        except Exception as e:
+            if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
+                return {"_task_id": task_id, "_numgpis": numgpis, "_duration": 0, "_status": "ok", "result": {}}
+            if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
+                return {"_task_id": task_id, "_numgpis": numgpis, "_duration": 0, "_status": "ok", "result": {}}
+            if attempt < _process_gpu_max_retries:
+                time.sleep(_process_gpu_retry_delay_seconds)
+                continue
+            return {
+                "_task_id": task_id,
+                "_numgpis": numgpis,
+                "_duration": 0,
+                "_status": "error",
+                "error_type": type(e).__name__,
+                "error_msg": str(e)[:200],
+            }
+
+
+def _execute_job_in_process(job, task_id):
+    if _process_val is None:
+        raise RuntimeError("Process worker not initialized.")
+    numgpis = num_gpis_from_job(job)
+    for attempt in range(_process_max_retries + 1):
+        start_time = datetime.now(tzlocal())
+        try:
+            result = _process_val.calc(
+                *job,
+                rename_cols=False,
+                only_with_reference=True,
+                handle_errors="ignore",
+            )
+            end_time = datetime.now(tzlocal())
+            duration = end_time - start_time
+            duration = (duration.days * 86400) + duration.seconds
+            return {"_task_id": task_id, "_numgpis": numgpis, "_duration": duration, "_status": "ok", "result": result}
+        except Exception as e:
+            if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
+                return {"_task_id": task_id, "_numgpis": numgpis, "_duration": 0, "_status": "ok", "result": {}}
+            if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
+                return {"_task_id": task_id, "_numgpis": numgpis, "_duration": 0, "_status": "ok", "result": {}}
+            if attempt < _process_max_retries:
+                time.sleep(_process_retry_delay_seconds)
+                continue
+            return {
+                "_task_id": task_id,
+                "_numgpis": numgpis,
+                "_duration": 0,
+                "_status": "error",
+                "error_type": type(e).__name__,
+                "error_msg": str(e)[:200],
+            }
 
 
 def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_seconds=1):
@@ -527,6 +771,64 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
             raise
 
 
+def _execute_gpu_job(validation_run, job, task_id=None, max_retries=1, retry_delay_seconds=1):
+    """Execute a single validation job using the GPU batched calculator."""
+    if task_id is None:
+        task_id = uuid.uuid4().hex
+    numgpis = num_gpis_from_job(job)
+    for attempt in range(max_retries + 1):
+        __logger.debug(
+            f"Executing GPU job {task_id} from validation {validation_run.id}, "
+            f"# of gpis: {numgpis}, attempt {attempt + 1}/{max_retries + 1}"
+        )
+        start_time = datetime.now(tzlocal())
+        try:
+            val = _create_gpu_validation(validation_run)
+
+            result = val.calc(
+                *job,
+                rename_cols=False,
+                only_with_reference=True,
+                handle_errors="ignore",
+            )
+            end_time = datetime.now(tzlocal())
+            duration = end_time - start_time
+            duration = (duration.days * 86400) + duration.seconds
+            __logger.debug(
+                f"Finished GPU job {task_id} from validation {validation_run.id}, "
+                f"took {duration} seconds for {numgpis} gpis"
+            )
+            return result
+        except Exception as e:
+            # Handle non-retriable KeyError cases (missing DataFrame columns)
+            if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
+                __logger.warning(
+                    f"GPU job {task_id} from validation {validation_run.id} hit non-retriable key error {e}. "
+                    "Marking job as empty result and continuing."
+                )
+                return {}
+            # Handle pytesmo TripleCollocationMetrics bug with empty DataFrames
+            if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
+                __logger.warning(
+                    "GPU job %s hit pytesmo tcol bug (empty DataFrame for dummy result). Returning empty result.",
+                    task_id,
+                )
+                return {}
+            if attempt < max_retries:
+                __logger.warning(
+                    "GPU job %s failed on attempt %s/%s (%s: %s). Retrying in %ss.",
+                    task_id,
+                    attempt + 1,
+                    max_retries + 1,
+                    type(e).__name__,
+                    str(e)[:120],
+                    retry_delay_seconds,
+                )
+                time.sleep(retry_delay_seconds)
+                continue
+            raise
+
+
 def check_and_store_results(job_id, results, save_path):
     if len(results) < 1:
         __logger.warning(f"Potentially problematic job: {job_id} - no results")
@@ -558,6 +860,66 @@ def check_and_store_results(job_id, results, save_path):
             return
 
         raise
+
+
+class ResultAccumulator:
+    """Accumulate validation results in memory and flush to netCDF in batches.
+
+    Reduces I/O contention by buffering results and writing them in batches.
+    Thread-safe via an internal lock; suitable for use from the main thread
+    that collects results from a ThreadPoolExecutor.
+    """
+
+    def __init__(self, save_path: str, flush_interval: int = 500):
+        self.save_path = save_path
+        self.flush_interval = flush_interval
+        self._buffer: list[tuple[str, dict]] = []
+        self._lock = threading.Lock()
+        self._total_pending = 0
+
+    def add(self, job_id: str, results: dict) -> None:
+        """Add results to the buffer. Flushes automatically when flush_interval is reached."""
+        with self._lock:
+            self._buffer.append((job_id, results))
+            self._total_pending += 1
+            if self._total_pending >= self.flush_interval:
+                self._flush_unlocked()
+
+    def flush(self) -> None:
+        """Force flush all buffered results to netCDF."""
+        with self._lock:
+            self._flush_unlocked()
+
+    def _flush_unlocked(self) -> None:
+        """Write all buffered results to netCDF. Must be called with lock held."""
+        if not self._buffer:
+            return
+        for job_id, results in self._buffer:
+            try:
+                if len(results) >= 1:
+                    netcdf_results_manager(results, self.save_path)
+            except OSError as exc:
+                # Handle corrupted nc file (same logic as check_and_store_results)
+                msg = str(exc)
+                recoverable = "NetCDF: Unknown file format" in msg or "NetCDF: Write to read only" in msg
+                if not recoverable:
+                    raise
+                bad_file = None
+                for token in msg.split("'"):
+                    if token.lower().endswith(".nc"):
+                        bad_file = token
+                        break
+                if bad_file and os.path.exists(bad_file):
+                    __logger.warning(
+                        "Detected corrupted netCDF file for job %s. Removing %s and retrying.",
+                        job_id,
+                        bad_file,
+                    )
+                    os.remove(bad_file)
+                    netcdf_results_manager(results, self.save_path)
+        __logger.debug("Flushed %s batched results to netCDF", len(self._buffer))
+        self._buffer.clear()
+        self._total_pending = 0
 
 
 def track_validation_task(validation_run, task_id):
@@ -592,14 +954,36 @@ def _count_job_status(results: dict, ngpis: int) -> tuple[int, int]:
     return nok, ngpis - nok
 
 
-def _process_job_result(task_id, future, job_table, validation_run, run_dir):
+def _process_job_result(task_id, future, job_table, validation_run, run_dir, accumulator=None):
     results = future.result()
     if not results:
         validation_run.error_points += num_gpis_from_job(job_table[task_id])
         return None
 
     results = _pytesmo_to_qa4sm_results(results)
-    check_and_store_results(task_id, results, run_dir)
+    if accumulator is not None:
+        accumulator.add(task_id, results)
+    else:
+        check_and_store_results(task_id, results, run_dir)
+
+    ngpis = num_gpis_from_job(job_table[task_id])
+    ok_pts, error_pts = _count_job_status(results, ngpis)
+    validation_run.ok_points += ok_pts
+    validation_run.error_points += error_pts
+    return results
+
+
+def _process_job_result_dict(task_id, results, job_table, validation_run, run_dir, accumulator=None):
+    """Process results from a dict (already unwrapped from process worker)."""
+    if not results:
+        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+        return None
+
+    results = _pytesmo_to_qa4sm_results(results)
+    if accumulator is not None:
+        accumulator.add(task_id, results)
+    else:
+        check_and_store_results(task_id, results, run_dir)
 
     ngpis = num_gpis_from_job(job_table[task_id])
     ok_pts, error_pts = _count_job_status(results, ngpis)
@@ -659,16 +1043,370 @@ def _clear_stale_outputs(run_dir):
     )
 
 
-def _determine_max_workers(jobs, ref_reader):
-    configured = getattr(settings, "MAX_PARALLEL_WORKERS", os.cpu_count() or 1)
+def _determine_executor(jobs, ref_reader):
+    configured = getattr(settings, "MAX_PARALLEL_WORKERS", max(1, (os.cpu_count() or 2) // 2))
     max_workers = max(1, min(len(jobs), configured))
-    if isinstance(ref_reader, ISMN_Interface) and max_workers > 1:
-        __logger.warning("ISMN reference reader is not safe for threaded execution. Forcing max_workers=1.")
-        max_workers = 1
-    return max_workers
+    if getattr(settings, "GPU_ENABLED", False) and get_gpu_backend().available:
+        # GPU is a shared resource; too many competing processes cause memory
+        # pressure and context-switch overhead. Cap at 4 workers.
+        gpu_workers = min(max_workers, 4)
+        __logger.info(
+            "Using GPU batched executor (%s workers).",
+            gpu_workers,
+        )
+        return "gpu", gpu_workers
+    if isinstance(ref_reader, ISMN_Interface):
+        if max_workers > 1:
+            __logger.info(
+                "Using process-based parallelism for ISMN data (%s workers) to avoid thread-safety issues.",
+                max_workers,
+            )
+            return "process", max_workers
+        return "thread", max_workers
+    if sys.platform.startswith("win") and max_workers > 1:
+        __logger.info(
+            "Using process-based parallelism on Windows (%s workers) to avoid HDF5 thread-safety issues.",
+            max_workers,
+        )
+        return "process", max_workers
+    return "thread", max_workers
 
 
-def run_validation(validation_run: ValidationRun):
+def _run_with_thread_pool(
+    validation_run,
+    jobs,
+    run_dir,
+    max_workers,
+    total_jobs,
+    run_started_at,
+    heartbeat_interval,
+):
+    last_results = None
+    last_heartbeat_at = run_started_at
+    validation_aborted = False
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task_id = {}
+        job_table = {}
+
+        for j in jobs:
+            task_id = uuid.uuid4().hex
+            future = executor.submit(execute_job, validation_run, j, task_id)
+            future_to_task_id[future] = task_id
+            job_table[task_id] = j
+            track_validation_task(validation_run, task_id)
+
+        pending = set(future_to_task_id.keys())
+        while pending:
+            done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
+
+            now = time.monotonic()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                completed_jobs = total_jobs - len(pending)
+                elapsed_seconds = int(now - run_started_at)
+                eta = _format_eta(elapsed_seconds, completed_jobs, total_jobs)
+                grid_done = validation_run.ok_points + validation_run.error_points
+                __logger.info(
+                    "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s "
+                    "grid_points=%s/%s eta=%s pending=%s",
+                    validation_run.id,
+                    elapsed_seconds,
+                    validation_run.progress,
+                    completed_jobs,
+                    total_jobs,
+                    grid_done,
+                    validation_run.total_points,
+                    eta,
+                    len(pending),
+                )
+                last_heartbeat_at = now
+
+            if not done:
+                if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
+                    validation_aborted = True
+                    __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
+                continue
+
+            for future in done:
+                task_id = future_to_task_id[future]
+                try:
+                    if validation_task_cancelled(task_id):
+                        validation_aborted = True
+
+                    if validation_aborted:
+                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                    else:
+                        res = _process_job_result(task_id, future, job_table, validation_run, run_dir)
+                        if res is not None:
+                            last_results = res
+
+                except Exception as e:
+                    validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                    __logger.error(
+                        "Job %s failed after all retries (%s: %s).",
+                        task_id,
+                        type(e).__name__,
+                        str(e)[:120],
+                    )
+                    if validation_task_cancelled(task_id):
+                        validation_aborted = True
+                finally:
+                    if not validation_task_cancelled(task_id):
+                        untrack_validation_task(task_id)
+
+                if not validation_aborted:
+                    validation_run.progress = round(
+                        (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
+                    )
+                else:
+                    validation_run.progress = -1
+
+    validation_run._aborted = validation_aborted
+    return last_results
+
+
+def _run_with_process_pool(
+    validation_run,
+    val_run_payload,
+    jobs,
+    run_dir,
+    max_workers,
+    total_jobs,
+    run_started_at,
+    heartbeat_interval,
+):
+    if val_run_payload is None:
+        raise ValueError("Process pool requires val_run_payload to initialize workers.")
+
+    last_results = None
+    last_heartbeat_at = run_started_at
+
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_process_worker,
+        initargs=(val_run_payload, 1, 1),
+    ) as executor:
+        future_to_task_id = {}
+        job_table = {}
+
+        for j in jobs:
+            task_id = uuid.uuid4().hex
+            future = executor.submit(_execute_job_in_process, j, task_id)
+            future_to_task_id[future] = task_id
+            job_table[task_id] = j
+            track_validation_task(validation_run, task_id)
+
+        pending = set(future_to_task_id.keys())
+        while pending:
+            done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
+
+            now = time.monotonic()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                completed_jobs = total_jobs - len(pending)
+                elapsed_seconds = int(now - run_started_at)
+                eta = _format_eta(elapsed_seconds, completed_jobs, total_jobs)
+                grid_done = validation_run.ok_points + validation_run.error_points
+                __logger.info(
+                    "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s "
+                    "grid_points=%s/%s eta=%s pending=%s",
+                    validation_run.id,
+                    elapsed_seconds,
+                    validation_run.progress,
+                    completed_jobs,
+                    total_jobs,
+                    grid_done,
+                    validation_run.total_points,
+                    eta,
+                    len(pending),
+                )
+                last_heartbeat_at = now
+
+            if not done:
+                continue
+
+            for future in done:
+                task_id = future_to_task_id[future]
+                try:
+                    wrapped = future.result()
+                    status = wrapped["_status"]
+                    result = wrapped["result"]
+                    numgpis = wrapped["_numgpis"]
+
+                    if status == "error":
+                        validation_run.error_points += numgpis
+                        __logger.error(
+                            "Job %s failed after all retries (%s: %s).",
+                            task_id,
+                            wrapped["error_type"],
+                            wrapped["error_msg"][:120],
+                        )
+                    elif not result:
+                        validation_run.error_points += numgpis
+                    else:
+                        results = _pytesmo_to_qa4sm_results(result)
+                        check_and_store_results(task_id, results, run_dir)
+                        ok_pts, error_pts = _count_job_status(results, numgpis)
+                        validation_run.ok_points += ok_pts
+                        validation_run.error_points += error_pts
+                        last_results = results
+
+                except Exception as e:
+                    validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                    __logger.error(
+                        "Job %s failed after all retries (%s: %s).",
+                        task_id,
+                        type(e).__name__,
+                        str(e)[:120],
+                    )
+                finally:
+                    if not validation_task_cancelled(task_id):
+                        untrack_validation_task(task_id)
+
+                validation_run.progress = round(
+                    (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
+                )
+
+    return last_results
+
+
+def _run_with_gpu_batch(
+    validation_run,
+    val_run_payload,
+    jobs,
+    run_dir,
+    max_workers,
+    total_jobs,
+    run_started_at,
+    heartbeat_interval,
+):
+    """Run validation jobs using the GPU batched executor.
+
+    Uses ProcessPoolExecutor to avoid HDF5/netCDF4 thread-safety issues on
+    Windows. Each worker process initializes its own GPU backend and readers.
+    """
+    if val_run_payload is None:
+        raise ValueError("GPU process pool requires val_run_payload to initialize workers.")
+
+    last_results = None
+    last_heartbeat_at = run_started_at
+    validation_aborted = False
+    accumulator = ResultAccumulator(run_dir, flush_interval=500)
+
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_gpu_process_worker,
+        initargs=(val_run_payload, 1, 1),
+    ) as executor:
+        future_to_task_id = {}
+        job_table = {}
+
+        for j in jobs:
+            task_id = uuid.uuid4().hex
+            future = executor.submit(_execute_gpu_job_in_process, j, task_id)
+            future_to_task_id[future] = task_id
+            job_table[task_id] = j
+            track_validation_task(validation_run, task_id)
+
+        pending = set(future_to_task_id.keys())
+        while pending:
+            done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
+
+            now = time.monotonic()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                completed_jobs = total_jobs - len(pending)
+                elapsed_seconds = int(now - run_started_at)
+                eta = _format_eta(elapsed_seconds, completed_jobs, total_jobs)
+                grid_done = validation_run.ok_points + validation_run.error_points
+                __logger.info(
+                    "Heartbeat validation %s (GPU): elapsed=%ss progress=%s%% jobs_completed=%s/%s "
+                    "grid_points=%s/%s eta=%s pending=%s",
+                    validation_run.id,
+                    elapsed_seconds,
+                    validation_run.progress,
+                    completed_jobs,
+                    total_jobs,
+                    grid_done,
+                    validation_run.total_points,
+                    eta,
+                    len(pending),
+                )
+                gpu_backend = get_gpu_backend()
+                if gpu_backend.available:
+                    free_bytes, total_bytes = gpu_backend.mem_info()
+                    used_mb = (total_bytes - free_bytes) / 1024 / 1024
+                    total_mb = total_bytes / 1024 / 1024
+                    __logger.info(
+                        "GPU memory: used=%.0fMB total=%.0fMB free=%.0fMB",
+                        used_mb,
+                        total_mb,
+                        free_bytes / 1024 / 1024,
+                    )
+                last_heartbeat_at = now
+
+            if not done:
+                if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
+                    validation_aborted = True
+                    __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
+                continue
+
+            for future in done:
+                task_id = future_to_task_id[future]
+                try:
+                    if validation_task_cancelled(task_id):
+                        validation_aborted = True
+
+                    if validation_aborted:
+                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                    else:
+                        wrapped = future.result()
+                        status = wrapped["_status"]
+                        result = wrapped["result"]
+                        numgpis = wrapped["_numgpis"]
+
+                        if status == "error":
+                            validation_run.error_points += numgpis
+                            __logger.error(
+                                "GPU job %s failed after all retries (%s: %s).",
+                                task_id,
+                                wrapped.get("error_type", "Unknown"),
+                                wrapped.get("error_msg", "")[:120],
+                            )
+                        else:
+                            validation_run.ok_points += numgpis
+                            if result:
+                                res = _process_job_result_dict(
+                                    task_id, result, job_table, validation_run, run_dir, accumulator
+                                )
+                                if res is not None:
+                                    last_results = res
+
+                except Exception as e:
+                    validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                    __logger.error(
+                        "GPU job %s failed after all retries (%s: %s).",
+                        task_id,
+                        type(e).__name__,
+                        str(e)[:120],
+                    )
+                    if validation_task_cancelled(task_id):
+                        validation_aborted = True
+                finally:
+                    if not validation_task_cancelled(task_id):
+                        untrack_validation_task(task_id)
+
+                if not validation_aborted:
+                    validation_run.progress = round(
+                        (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
+                    )
+                else:
+                    validation_run.progress = -1
+
+    accumulator.flush()
+    validation_run._aborted = validation_aborted
+    return last_results
+
+
+def run_validation(validation_run: ValidationRun, val_run_payload: dict | None = None):
     __logger.info(f"Starting validation: {validation_run.id}")
     validation_aborted = False
 
@@ -678,91 +1416,65 @@ def run_validation(validation_run: ValidationRun):
         _clear_stale_outputs(run_dir)
 
         ref_reader, read_name, read_kwargs = _get_spatial_reference_reader(validation_run)
+        # Determine batch size: group cells into larger batches when GPU is enabled
+        batch_size = None
+        if getattr(settings, "GPU_ENABLED", False) and getattr(settings, "GPU_BATCH_SIZE", 0) > 0:
+            batch_size = settings.GPU_BATCH_SIZE
         total_points, jobs = create_jobs(
             validation_run=validation_run,
             reader=ref_reader,
             dataset_config=validation_run.spatial_reference_configuration,
+            batch_size=batch_size,
         )
         validation_run.total_points = total_points
         __logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
 
-        max_workers = _determine_max_workers(jobs, ref_reader)
-        __logger.info(f"Running validation {validation_run.id} with {max_workers} parallel workers.")
+        executor_type, max_workers = _determine_executor(jobs, ref_reader)
+        __logger.info(
+            "Running validation %s with %s %s workers.",
+            validation_run.id,
+            max_workers,
+            executor_type,
+        )
         total_jobs = len(jobs)
         run_started_at = time.monotonic()
-        last_heartbeat_at = run_started_at
         heartbeat_interval = getattr(settings, "HEARTBEAT_INTERVAL_SECONDS", 60)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task_id = {}
-            job_table = {}
-            last_results = None
-
-            for j in jobs:
-                task_id = uuid.uuid4().hex
-                future = executor.submit(execute_job, validation_run, j, task_id)
-                future_to_task_id[future] = task_id
-                job_table[task_id] = j
-                track_validation_task(validation_run, task_id)
-
-            pending = set(future_to_task_id.keys())
-            while pending:
-                done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
-
-                now = time.monotonic()
-                if now - last_heartbeat_at >= heartbeat_interval:
-                    completed_jobs = total_jobs - len(pending)
-                    elapsed_seconds = int(now - run_started_at)
-                    __logger.info(
-                        "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s pending=%s",
-                        validation_run.id,
-                        elapsed_seconds,
-                        validation_run.progress,
-                        completed_jobs,
-                        total_jobs,
-                        len(pending),
-                    )
-                    last_heartbeat_at = now
-
-                if not done:
-                    if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
-                        validation_aborted = True
-                        __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
-                    continue
-
-                for future in done:
-                    task_id = future_to_task_id[future]
-                    try:
-                        if validation_task_cancelled(task_id):
-                            validation_aborted = True
-
-                        if validation_aborted:
-                            validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                        else:
-                            res = _process_job_result(task_id, future, job_table, validation_run, run_dir)
-                            if res is not None:
-                                last_results = res
-
-                    except Exception as e:
-                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                        __logger.error(
-                            "Job %s failed after all retries (%s: %s).",
-                            task_id,
-                            type(e).__name__,
-                            str(e)[:120],
-                        )
-                        if validation_task_cancelled(task_id):
-                            validation_aborted = True
-                    finally:
-                        if not validation_task_cancelled(task_id):
-                            untrack_validation_task(task_id)
-
-                    if not validation_aborted:
-                        validation_run.progress = round(
-                            (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
-                        )
-                    else:
-                        validation_run.progress = -1
+        if executor_type == "gpu":
+            last_results = _run_with_gpu_batch(
+                validation_run,
+                val_run_payload,
+                jobs,
+                run_dir,
+                max_workers,
+                total_jobs,
+                run_started_at,
+                heartbeat_interval,
+            )
+            validation_aborted = getattr(validation_run, "_aborted", False)
+        elif executor_type == "process":
+            last_results = _run_with_process_pool(
+                validation_run,
+                val_run_payload,
+                jobs,
+                run_dir,
+                max_workers,
+                total_jobs,
+                run_started_at,
+                heartbeat_interval,
+            )
+            validation_aborted = False
+        else:
+            last_results = _run_with_thread_pool(
+                validation_run,
+                jobs,
+                run_dir,
+                max_workers,
+                total_jobs,
+                run_started_at,
+                heartbeat_interval,
+            )
+            validation_aborted = getattr(validation_run, "_aborted", False)
 
         if not validation_aborted and last_results is not None:
             _post_process_run(validation_run, run_dir, last_results)
@@ -771,6 +1483,19 @@ def run_validation(validation_run: ValidationRun):
         __logger.exception(f"Unexpected exception during validation {validation_run}:")
 
     finally:
+        cache = get_ts_cache()
+        stats = cache.stats()
+        if stats["hits"] + stats["misses"] > 0:
+            hit_rate = stats["hits"] / (stats["hits"] + stats["misses"]) * 100
+            __logger.info(
+                "TS cache stats: hits=%s misses=%s evictions=%s hit_rate=%.1f%% size=%.1fMB entries=%s",
+                stats["hits"],
+                stats["misses"],
+                stats["evictions"],
+                hit_rate,
+                stats["size_bytes"] / 1024 / 1024,
+                stats["entries"],
+            )
         validation_run.end_time = datetime.now(tzlocal())
         __logger.info(
             f"Validation finished: {validation_run}. "

@@ -5,47 +5,50 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dask[distributed]>=2026.1.2",
-    "ismn>=1.5.2",
-    "numpy>=2.4.3",
-    "pandas>=3.0.1",
-    "pygeobase>=0.6.3",
-    "pygeogrids>=0.5.3",
-    "pynetcf>=0.5.2",
-    "pytesmo>=0.18.0",
-    "pytz>=2026.1.post1",
-    "qa4sm-preprocessing",
-    "qa4sm-reader",
-    "rioxarray>=0.22.0",
-    "scipy>=1.17.1",
-    "setuptools>=83.0.0",
-    "smap-io>=0.8",
-    "xarray>=2026.2.0",
+  "dask[distributed]>=2026.1.2",
+  "ismn>=1.5.2",
+  "numpy>=2.4.3",
+  "pandas>=3.0.1",
+  "pygeobase>=0.6.3",
+  "pygeogrids>=0.5.3",
+  "pynetcf>=0.5.2",
+  "pyqt5-qt5==5.15.2; sys_platform == 'win32'",
+  "pytesmo>=0.18.0",
+  "pytz>=2026.1.post1",
+  "qa4sm-preprocessing",
+  "qa4sm-reader",
+  "rioxarray>=0.22.0",
+  "scipy>=1.17.1",
+  "setuptools>=83.0.0",
+  "smap-io>=0.8",
+  "xarray>=2026.2.0",
 ]
-
-[tool.uv.sources]
-qa4sm-preprocessing = { path = "qa4sm-preprocessing", editable = true }
-qa4sm-reader = { path = "qa4sm-reader", editable = true }
-
-[build-system]
-requires = ["setuptools>=83.0.0"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-where = ["."]
-
-[tool.setuptools.package-data]
-validator = ["validation_run.template.json"]
 
 [project.scripts]
 qa4sm-validate = "validator.cli:main"
 
 [project.optional-dependencies]
 dev = [
-    "mypy>=1.0",
-    "pytest>=8.0",
-    "ruff>=0.9",
+  "mypy>=1.0",
+  "pytest>=8.0",
+  "ruff>=0.9",
 ]
+gpu = [
+  "torch>=2.0",
+]
+
+[build-system]
+requires = ["setuptools>=83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.mypy]
+python_version = "3.13"
+strict = false
+exclude = ["qa4sm-reader", "qa4sm-preprocessing"]
+
+[tool.pytest.ini_options]
+addopts = "-v --tb=short -p no:cacheprovider"
+testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py313"
@@ -58,11 +61,19 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.ruff.format]
 quote-style = "double"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-v --tb=short -p no:cacheprovider"
+[tool.setuptools.packages.find]
+where = ["."]
 
-[tool.mypy]
-python_version = "3.13"
-strict = false
-exclude = ["qa4sm-reader", "qa4sm-preprocessing"]
+[tool.setuptools.package-data]
+validator = ["validation_run.template.json"]
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+# qa4sm-preprocessing = { path = "qa4sm-preprocessing", editable = true }
+# qa4sm-reader = { path = "qa4sm-reader", editable = true }

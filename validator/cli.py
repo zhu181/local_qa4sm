@@ -3,6 +3,7 @@ import json
 import logging
 import signal
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 from validator.orchestrator import (
@@ -153,6 +154,29 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional override for parallel worker count used by validation.",
     )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Disable GPU acceleration and use CPU-only execution.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override grid points per job batch (default: 500 for GPU, 100 for CPU).",
+    )
+    parser.add_argument(
+        "--cache-size-mb",
+        type=int,
+        default=None,
+        help="Override time series cache size in MB (default: 512).",
+    )
+    parser.add_argument(
+        "--gpu-device",
+        type=int,
+        default=None,
+        help="Select GPU device index (default: 0).",
+    )
     return parser
 
 
@@ -241,17 +265,32 @@ def _validate_dataset_inputs(val_run) -> None:
                 ) from e
 
 
+def _default_log_file(config_path: Path) -> Path:
+    from validator.settings import MEDIA_ROOT
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config_stem = config_path.stem
+    log_dir = Path(MEDIA_ROOT)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"qa4sm_{timestamp}_{config_stem}.log"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    noise_filter = _configure_logging(args.log_level, args.log_file)
-    _install_termination_signal_handlers()
 
     config_path = Path(args.config)
     if not config_path.exists():
         parser.error(f"Config file not found: {config_path}")
 
-    LOGGER.info("CLI started. config=%s dry_run=%s", config_path, args.dry_run)
+    log_file = args.log_file
+    if log_file is None:
+        log_file = str(_default_log_file(config_path))
+
+    noise_filter = _configure_logging(args.log_level, log_file)
+    _install_termination_signal_handlers()
+
+    LOGGER.info("CLI started. config=%s dry_run=%s log_file=%s", config_path, args.dry_run, log_file)
 
     try:
         if args.dry_run:
@@ -265,6 +304,34 @@ def main(argv: list[str] | None = None) -> int:
             settings.MAX_PARALLEL_WORKERS = args.max_workers
             LOGGER.info("Overriding MAX_PARALLEL_WORKERS to %s", settings.MAX_PARALLEL_WORKERS)
 
+        if args.no_gpu:
+            from validator import settings
+
+            settings.GPU_ENABLED = False
+            LOGGER.info("GPU acceleration disabled via --no-gpu")
+
+        if args.batch_size is not None:
+            if args.batch_size < 1:
+                raise ValueError("--batch-size must be >= 1")
+            from validator import settings
+
+            settings.GPU_BATCH_SIZE = args.batch_size
+            LOGGER.info("Overriding GPU_BATCH_SIZE to %s", settings.GPU_BATCH_SIZE)
+
+        if args.cache_size_mb is not None:
+            if args.cache_size_mb < 0:
+                raise ValueError("--cache-size-mb must be >= 0")
+            from validator import settings
+
+            settings.TS_CACHE_SIZE_MB = args.cache_size_mb
+            LOGGER.info("Overriding TS_CACHE_SIZE_MB to %s", settings.TS_CACHE_SIZE_MB)
+
+        if args.gpu_device is not None:
+            from validator import settings
+
+            settings.GPU_DEVICE_ID = args.gpu_device
+            LOGGER.info("Overriding GPU_DEVICE_ID to %s", settings.GPU_DEVICE_ID)
+
         with config_path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
         val_run = parse_validation_run_config(payload)
@@ -273,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.info("Starting validation run from %s", config_path)
         from validator.validation import run_validation
 
-        result = run_validation(val_run)
+        result = run_validation(val_run, val_run_payload=payload)
         LOGGER.info(
             "Validation finished. id=%s config_id=%s total=%s ok=%s error=%s",
             result.id,

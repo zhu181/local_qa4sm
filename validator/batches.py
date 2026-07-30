@@ -101,6 +101,7 @@ def create_jobs(
     reader,
     dataset_config: DatasetConfiguration,
     return_points=True,
+    batch_size: int | None = None,
 ) -> tuple | list:
     """
     Create jobs for validation run. The reference reader is passed here.
@@ -115,6 +116,10 @@ def create_jobs(
         configuration of the dataset that the reader belongs to
     return_points: bool, default is True
         If True, return total_points
+    batch_size: int | None, default is None
+        When set to a positive integer, individual grid cell jobs are grouped
+        into larger batches of up to ``batch_size`` grid points each. When
+        ``None`` (the default), one job is created per cell as before.
 
     Returns
     -------
@@ -235,10 +240,87 @@ def create_jobs(
     else:
         raise ValueError(f"Don't know how to get gridpoints and generate jobs for reader {reader}")
 
+    if batch_size is not None and batch_size > 0:
+        jobs = _group_jobs_into_batches(jobs, batch_size)
+
     if not return_points:
         return jobs
 
     return total_points, jobs
+
+
+def _group_jobs_into_batches(jobs: list, batch_size: int) -> list:
+    """Group multiple jobs into larger batches of up to batch_size grid points each.
+
+    Preserves the job tuple structure: (gpis, lons, lats) or (gpis, lons, lats, meta_list).
+    """
+    if not jobs or batch_size <= 0:
+        return jobs
+
+    # Determine if jobs have metadata (4-tuple) or not (3-tuple)
+    has_meta = len(jobs[0]) == 4
+
+    grouped = []
+    current_gpis = []
+    current_lons = []
+    current_lats = []
+    current_meta = [] if has_meta else None
+
+    for job in jobs:
+        gpis, lons, lats = job[0], job[1], job[2]
+        meta = job[3] if has_meta else None
+
+        for i in range(len(gpis)):
+            current_gpis.append(gpis[i])
+            current_lons.append(lons[i])
+            current_lats.append(lats[i])
+            if has_meta:
+                current_meta.append(meta[i])
+
+            if len(current_gpis) >= batch_size:
+                if has_meta:
+                    grouped.append(
+                        (
+                            np.array(current_gpis),
+                            np.array(current_lons),
+                            np.array(current_lats),
+                            current_meta,
+                        )
+                    )
+                else:
+                    grouped.append(
+                        (
+                            np.array(current_gpis),
+                            np.array(current_lons),
+                            np.array(current_lats),
+                        )
+                    )
+                current_gpis = []
+                current_lons = []
+                current_lats = []
+                current_meta = [] if has_meta else None
+
+    # Flush remaining
+    if current_gpis:
+        if has_meta:
+            grouped.append(
+                (
+                    np.array(current_gpis),
+                    np.array(current_lons),
+                    np.array(current_lats),
+                    current_meta,
+                )
+            )
+        else:
+            grouped.append(
+                (
+                    np.array(current_gpis),
+                    np.array(current_lons),
+                    np.array(current_lats),
+                )
+            )
+
+    return grouped
 
 
 def create_upscaling_lut(validation_run: ValidationRun, datasets, spatial_ref_name) -> dict:
