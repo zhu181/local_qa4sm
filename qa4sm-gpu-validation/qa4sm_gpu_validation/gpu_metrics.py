@@ -1,4 +1,4 @@
-"""Batched GPU metric calculators for QA4SM validation.
+"""Batched GPU metric calculators compatible with pytesmo's validation framework.
 
 Computes pytesmo-compatible pairwise and triple collocation metrics for N
 grid points in a single batched pass using PyTorch (GPU) with automatic
@@ -12,9 +12,16 @@ The :class:`GPUBatchedValidation` class wraps a pytesmo ``DataManager`` and
 provides a ``calc()`` method that is a drop-in replacement for
 ``pytesmo.validation_framework.validation.Validation.calc()``, but computes
 metrics in a single batched GPU pass instead of per-grid-point.
+
+Thread safety: HDF5/netCDF4 reads are serialized via the module-level
+:data:`qa4sm_gpu_validation.read_lock.HDF5_READ_LOCK`, which is only held
+during the read call itself so subsequent GPU/NumPy compute stays parallel.
+Each worker thread is expected to use its own :class:`GPUBatchedValidation`
+instance (see the per-thread cache pattern in the validator package).
 """
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -23,7 +30,7 @@ from pytesmo.validation_framework.data_manager import get_result_combinations
 from pytesmo.validation_framework.data_scalers import DefaultScaler
 from scipy import stats
 
-from validator.gpu_backend import get_gpu_backend
+from qa4sm_gpu_validation.gpu_backend import get_gpu_backend
 
 LOGGER = logging.getLogger(__name__)
 
@@ -581,7 +588,7 @@ class BatchedTCAMetrics:
 
     def _add_bootstrap_cis(
         self,
-        results: list[dict | None],
+        results: Sequence[dict | None],
         data_list: list[pd.DataFrame],
         nsamples: int,
         alpha: float,
@@ -951,11 +958,16 @@ class GPUBatchedValidation:
         return (gpi, lon, lat)
 
     def _read_data(self, gpi, lon, lat) -> dict:
-        try:
-            return self.datamanager.get_data(gpi, lon, lat)
-        except Exception as exc:
-            LOGGER.warning("Failed to read data for gpi %s: %s", gpi, exc)
-            return {}
+        # Serialize HDF5/netCDF4 reads across worker threads to avoid the
+        # Windows 0xC0000005 access violation.
+        from qa4sm_gpu_validation.read_lock import HDF5_READ_LOCK
+
+        with HDF5_READ_LOCK:
+            try:
+                return self.datamanager.get_data(gpi, lon, lat)
+            except Exception as exc:
+                LOGGER.warning("Failed to read data for gpi %s: %s", gpi, exc)
+                return {}
 
     def _extract_data_columns(self, df_dict: dict) -> dict:
         data_df_dict = {}

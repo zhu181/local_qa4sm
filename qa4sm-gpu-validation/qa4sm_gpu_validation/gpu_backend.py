@@ -1,11 +1,18 @@
-"""GPU backend detection and configuration for QA4SM validation.
+"""GPU backend detection and configuration for qa4sm-gpu-validation.
 
 Provides a PyTorch-backed tensor computation backend with automatic fallback
 to NumPy when CUDA is unavailable. Importing this module never fails even when
 PyTorch is not installed; the singleton is initialized lazily on first access.
+
+The selected CUDA device defaults to the ``QA4SM_GPU_DEVICE_ID`` environment
+variable (0 when unset) and can be overridden per process via
+:func:`get_gpu_backend`. Initialization is guarded by a lock so concurrent
+first access from multiple worker threads is safe.
 """
 
 import logging
+import os
+import threading
 from typing import Any
 
 import numpy
@@ -174,14 +181,26 @@ class GPUBackend:
 
 _gpu_backend: GPUBackend | None = None
 
+# Guards the lazy singleton initialization so concurrent first access from
+# multiple worker threads cannot race on backend construction.
+_gpu_backend_lock = threading.Lock()
 
-def get_gpu_backend() -> GPUBackend:
-    """Return the lazily-initialized GPU backend singleton."""
+
+def get_gpu_backend(device_id: int | None = None) -> GPUBackend:
+    """Return the lazily-initialized GPU backend singleton.
+
+    The first call creates the singleton; ``device_id`` is honored only on
+    that first call (subsequent calls return the existing instance). When
+    ``device_id`` is ``None`` the ``QA4SM_GPU_DEVICE_ID`` environment
+    variable is used (default 0).
+    """
     global _gpu_backend
     if _gpu_backend is None:
-        from validator import settings
-
-        _gpu_backend = GPUBackend(device_id=settings.GPU_DEVICE_ID)
+        with _gpu_backend_lock:
+            if _gpu_backend is None:
+                if device_id is None:
+                    device_id = int(os.environ.get("QA4SM_GPU_DEVICE_ID", "0"))
+                _gpu_backend = GPUBackend(device_id=device_id)
     return _gpu_backend
 
 

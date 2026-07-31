@@ -1,4 +1,4 @@
-from validator.gpu_backend import GPUBackend, get_xp
+from qa4sm_gpu_validation.gpu_backend import GPUBackend, get_xp
 
 
 def test_gpu_backend_fallback_to_numpy():

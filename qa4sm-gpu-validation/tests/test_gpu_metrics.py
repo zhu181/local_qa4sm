@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
-
-from validator.gpu_metrics import BatchedPairwiseMetrics, BatchedTCAMetrics
+from qa4sm_gpu_validation.gpu_metrics import BatchedPairwiseMetrics, BatchedTCAMetrics
 
 
 @pytest.fixture

@@ -1,0 +1,43 @@
+[project]
+name = "qa4sm-gpu-validation"
+version = "0.1.0"
+description = "Thread-safe, GPU-accelerated, parallel pytesmo-compatible validation metrics"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "numpy>=2.4.3,<2.5",  # numba 0.64 (py3.13) requires numpy<2.5
+  "pandas>=3.0.1",
+  "pytesmo>=0.18.0",
+  "scipy>=1.17.1",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "torch>=2.0",
+]
+
+[build-system]
+requires = ["setuptools>=83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qa4sm_gpu_validation*"]
+
+[tool.pytest.ini_options]
+addopts = "-v --tb=short -p no:cacheprovider"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.13"
+strict = false

@@ -33,6 +33,9 @@ from pytesmo.validation_framework.temporal_matchers import (
 )
 from pytesmo.validation_framework.validation import Validation
 from pytz import UTC
+from qa4sm_gpu_validation.gpu_backend import get_gpu_backend
+from qa4sm_gpu_validation.gpu_metrics import GPUBatchedValidation
+from qa4sm_gpu_validation.read_lock import HDF5_READ_LOCK
 from qa4sm_reader.intra_annual_temp_windows import (
     TemporalSubWindowsCreator,
     TemporalSubWindowsFactory,
@@ -54,15 +57,13 @@ from validator.globals import (
     TEMPORAL_SUB_WINDOW_SEPARATOR,
     TEMPORAL_SUB_WINDOWS,
 )
-from validator.gpu_backend import get_gpu_backend
-from validator.gpu_metrics import GPUBatchedValidation
 from validator.graphics import generate_all_graphs
 from validator.models import DatasetVersion, ValidationRun, ValidationTask
 from validator.readers import adapt_timestamp, create_reader
 from validator.ts_cache import CachedReader, get_ts_cache
 from validator.utils import first_file_in, mkdir_if_not_exists
 
-__logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def _format_eta(elapsed_seconds: int, completed: int, total: int) -> str:
@@ -193,7 +194,7 @@ def save_validation_config(validation_run: ValidationRun):
                     try:
                         filters += "; ".join(_list_comp)
                     except TypeError as e:
-                        __logger.error(f"Error in save_validation_config: {e}. {filters=}{_list_comp=}")
+                        logger.error(f"Error in save_validation_config: {e}. {filters=}{_list_comp=}")
                         filters = "; ".join(_list_comp)
 
                 if not filters:
@@ -286,7 +287,7 @@ def save_validation_config(validation_run: ValidationRun):
                 )
 
     except Exception:
-        __logger.exception("Validation configuration could not be stored.")
+        logger.exception("Validation configuration could not be stored.")
 
 
 def _apply_anomaly_adapter(reader, validation_run, dataset_config, read_name):
@@ -612,6 +613,13 @@ _process_val = None
 _process_max_retries = 1
 _process_retry_delay_seconds = 1
 
+# Global lock protecting concurrent access to HDF5/netCDF4 files. Required to
+# avoid Windows 0xC0000005 access violations when multiple threads open/read
+# the same netCDF file in parallel. The lock is only held during the read call
+# itself; subsequent GPU/numpy compute is parallel. Owned by the
+# qa4sm-gpu-validation library so GPUBatchedValidation._read_data shares it.
+_hdf5_read_lock = HDF5_READ_LOCK
+
 _process_gpu_val = None
 _process_gpu_max_retries = 1
 _process_gpu_retry_delay_seconds = 1
@@ -719,7 +727,7 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
         task_id = uuid.uuid4().hex
     numgpis = num_gpis_from_job(job)
     for attempt in range(max_retries + 1):
-        __logger.debug(
+        logger.debug(
             f"Executing job {task_id} from validation {validation_run.id}, "
             f"# of gpis: {numgpis}, attempt {attempt + 1}/{max_retries + 1}"
         )
@@ -736,7 +744,7 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
             end_time = datetime.now(tzlocal())
             duration = end_time - start_time
             duration = (duration.days * 86400) + duration.seconds
-            __logger.debug(
+            logger.debug(
                 f"Finished job {task_id} from validation {validation_run.id}, "
                 f"took {duration} seconds for {numgpis} gpis"
             )
@@ -744,20 +752,20 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
         except Exception as e:
             # Handle non-retriable KeyError cases (missing DataFrame columns)
             if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
-                __logger.warning(
+                logger.warning(
                     f"Job {task_id} from validation {validation_run.id} hit non-retriable key error {e}. "
                     "Marking job as empty result and continuing."
                 )
                 return {}
             # Handle pytesmo TripleCollocationMetrics bug with empty DataFrames
             if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
-                __logger.warning(
+                logger.warning(
                     "Job %s hit pytesmo tcol bug (empty DataFrame for dummy result). Returning empty result.",
                     task_id,
                 )
                 return {}
             if attempt < max_retries:
-                __logger.warning(
+                logger.warning(
                     "Job %s failed on attempt %s/%s (%s: %s). Retrying in %ss.",
                     task_id,
                     attempt + 1,
@@ -771,19 +779,39 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
             raise
 
 
+# Per-thread cache of GPU validation objects so we don't rebuild the
+# DataManager and underlying readers for every job (which would dominate
+# the per-job cost). Reset on validation_id change.
+_thread_local = threading.local()
+
+
+def _get_thread_gpu_validation(validation_run):
+    """Return a per-thread GPU validation, building it on first use."""
+    cache = getattr(_thread_local, "gpu_validations", None)
+    if cache is None:
+        cache = {}
+        _thread_local.gpu_validations = cache
+    cached = cache.get(validation_run.id)
+    if cached is not None:
+        return cached
+    val = _create_gpu_validation(validation_run)
+    cache[validation_run.id] = val
+    return val
+
+
 def _execute_gpu_job(validation_run, job, task_id=None, max_retries=1, retry_delay_seconds=1):
     """Execute a single validation job using the GPU batched calculator."""
     if task_id is None:
         task_id = uuid.uuid4().hex
     numgpis = num_gpis_from_job(job)
     for attempt in range(max_retries + 1):
-        __logger.debug(
+        logger.debug(
             f"Executing GPU job {task_id} from validation {validation_run.id}, "
             f"# of gpis: {numgpis}, attempt {attempt + 1}/{max_retries + 1}"
         )
         start_time = datetime.now(tzlocal())
         try:
-            val = _create_gpu_validation(validation_run)
+            val = _get_thread_gpu_validation(validation_run)
 
             result = val.calc(
                 *job,
@@ -794,7 +822,7 @@ def _execute_gpu_job(validation_run, job, task_id=None, max_retries=1, retry_del
             end_time = datetime.now(tzlocal())
             duration = end_time - start_time
             duration = (duration.days * 86400) + duration.seconds
-            __logger.debug(
+            logger.debug(
                 f"Finished GPU job {task_id} from validation {validation_run.id}, "
                 f"took {duration} seconds for {numgpis} gpis"
             )
@@ -802,20 +830,20 @@ def _execute_gpu_job(validation_run, job, task_id=None, max_retries=1, retry_del
         except Exception as e:
             # Handle non-retriable KeyError cases (missing DataFrame columns)
             if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
-                __logger.warning(
+                logger.warning(
                     f"GPU job {task_id} from validation {validation_run.id} hit non-retriable key error {e}. "
                     "Marking job as empty result and continuing."
                 )
                 return {}
             # Handle pytesmo TripleCollocationMetrics bug with empty DataFrames
             if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
-                __logger.warning(
+                logger.warning(
                     "GPU job %s hit pytesmo tcol bug (empty DataFrame for dummy result). Returning empty result.",
                     task_id,
                 )
                 return {}
             if attempt < max_retries:
-                __logger.warning(
+                logger.warning(
                     "GPU job %s failed on attempt %s/%s (%s: %s). Retrying in %ss.",
                     task_id,
                     attempt + 1,
@@ -831,7 +859,7 @@ def _execute_gpu_job(validation_run, job, task_id=None, max_retries=1, retry_del
 
 def check_and_store_results(job_id, results, save_path):
     if len(results) < 1:
-        __logger.warning(f"Potentially problematic job: {job_id} - no results")
+        logger.warning(f"Potentially problematic job: {job_id} - no results")
         return
 
     try:
@@ -850,7 +878,7 @@ def check_and_store_results(job_id, results, save_path):
                 break
 
         if bad_file and os.path.exists(bad_file):
-            __logger.warning(
+            logger.warning(
                 "Detected corrupted netCDF result file for job %s. Removing %s and retrying write once.",
                 job_id,
                 bad_file,
@@ -910,14 +938,14 @@ class ResultAccumulator:
                         bad_file = token
                         break
                 if bad_file and os.path.exists(bad_file):
-                    __logger.warning(
+                    logger.warning(
                         "Detected corrupted netCDF file for job %s. Removing %s and retrying.",
                         job_id,
                         bad_file,
                     )
                     os.remove(bad_file)
                     netcdf_results_manager(results, self.save_path)
-        __logger.debug("Flushed %s batched results to netCDF", len(self._buffer))
+        logger.debug("Flushed %s batched results to netCDF", len(self._buffer))
         self._buffer.clear()
         self._total_pending = 0
 
@@ -940,7 +968,7 @@ def untrack_validation_task(task_id):
         validation_task = ValidationTask.objects.get(task_id=task_id)
         validation_task.delete()
     except ValidationTask.DoesNotExist:
-        __logger.debug(f"Task {task_id} already deleted from db.")
+        logger.debug(f"Task {task_id} already deleted from db.")
 
 
 def _count_job_status(results: dict, ngpis: int) -> tuple[int, int]:
@@ -1017,7 +1045,7 @@ def _post_process_run(validation_run, run_dir, results):
     transcriber.compress(path=transcriber.output_file_name, compression="zlib", complevel=9)
 
     temporal_sub_windows_names = [DEFAULT_TSW] if temp_sub_wdws is None else temp_sub_wdw_instance.names
-    __logger.info(f"temporal_sub_windows_names: {temporal_sub_windows_names}")
+    logger.info(f"temporal_sub_windows_names: {temporal_sub_windows_names}")
 
     generate_all_graphs(
         validation_run=validation_run,
@@ -1035,8 +1063,8 @@ def _clear_stale_outputs(run_dir):
         try:
             os.remove(nc_file)
         except OSError:
-            __logger.warning("Could not remove stale netCDF file %s", nc_file)
-    __logger.info(
+            logger.warning("Could not remove stale netCDF file %s", nc_file)
+    logger.info(
         "Removed %s stale netCDF file(s) from %s before starting validation.",
         len(stale),
         run_dir,
@@ -1046,25 +1074,24 @@ def _clear_stale_outputs(run_dir):
 def _determine_executor(jobs, ref_reader):
     configured = getattr(settings, "MAX_PARALLEL_WORKERS", max(1, (os.cpu_count() or 2) // 2))
     max_workers = max(1, min(len(jobs), configured))
-    if getattr(settings, "GPU_ENABLED", False) and get_gpu_backend().available:
-        # GPU is a shared resource; too many competing processes cause memory
-        # pressure and context-switch overhead. Cap at 4 workers.
-        gpu_workers = min(max_workers, 4)
-        __logger.info(
+    if getattr(settings, "GPU_ENABLED", False) and get_gpu_backend(device_id=settings.GPU_DEVICE_ID).available:
+        # GPU reads are serialized via _hdf5_read_lock, so additional workers
+        # mostly add GPU-compute parallelism rather than I/O contention.
+        logger.info(
             "Using GPU batched executor (%s workers).",
-            gpu_workers,
+            max_workers,
         )
-        return "gpu", gpu_workers
+        return "gpu", max_workers
     if isinstance(ref_reader, ISMN_Interface):
         if max_workers > 1:
-            __logger.info(
+            logger.info(
                 "Using process-based parallelism for ISMN data (%s workers) to avoid thread-safety issues.",
                 max_workers,
             )
             return "process", max_workers
         return "thread", max_workers
     if sys.platform.startswith("win") and max_workers > 1:
-        __logger.info(
+        logger.info(
             "Using process-based parallelism on Windows (%s workers) to avoid HDF5 thread-safety issues.",
             max_workers,
         )
@@ -1106,7 +1133,7 @@ def _run_with_thread_pool(
                 elapsed_seconds = int(now - run_started_at)
                 eta = _format_eta(elapsed_seconds, completed_jobs, total_jobs)
                 grid_done = validation_run.ok_points + validation_run.error_points
-                __logger.info(
+                logger.info(
                     "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s "
                     "grid_points=%s/%s eta=%s pending=%s",
                     validation_run.id,
@@ -1124,7 +1151,7 @@ def _run_with_thread_pool(
             if not done:
                 if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
                     validation_aborted = True
-                    __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
+                    logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
                 continue
 
             for future in done:
@@ -1142,7 +1169,7 @@ def _run_with_thread_pool(
 
                 except Exception as e:
                     validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                    __logger.error(
+                    logger.error(
                         "Job %s failed after all retries (%s: %s).",
                         task_id,
                         type(e).__name__,
@@ -1206,7 +1233,7 @@ def _run_with_process_pool(
                 elapsed_seconds = int(now - run_started_at)
                 eta = _format_eta(elapsed_seconds, completed_jobs, total_jobs)
                 grid_done = validation_run.ok_points + validation_run.error_points
-                __logger.info(
+                logger.info(
                     "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s "
                     "grid_points=%s/%s eta=%s pending=%s",
                     validation_run.id,
@@ -1234,7 +1261,7 @@ def _run_with_process_pool(
 
                     if status == "error":
                         validation_run.error_points += numgpis
-                        __logger.error(
+                        logger.error(
                             "Job %s failed after all retries (%s: %s).",
                             task_id,
                             wrapped["error_type"],
@@ -1252,7 +1279,7 @@ def _run_with_process_pool(
 
                 except Exception as e:
                     validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                    __logger.error(
+                    logger.error(
                         "Job %s failed after all retries (%s: %s).",
                         task_id,
                         type(e).__name__,
@@ -1281,28 +1308,26 @@ def _run_with_gpu_batch(
 ):
     """Run validation jobs using the GPU batched executor.
 
-    Uses ProcessPoolExecutor to avoid HDF5/netCDF4 thread-safety issues on
-    Windows. Each worker process initializes its own GPU backend and readers.
+    Uses ThreadPoolExecutor with a global ``_hdf5_read_lock`` to serialize
+    HDF5/netCDF4 reads across worker threads. The lock is only held during
+    file I/O, so subsequent GPU/numpy compute is fully parallel. This avoids
+    the prohibitive pickle overhead of ProcessPoolExecutor.
     """
     if val_run_payload is None:
-        raise ValueError("GPU process pool requires val_run_payload to initialize workers.")
+        raise ValueError("GPU thread pool requires val_run_payload for _execute_gpu_job.")
 
     last_results = None
     last_heartbeat_at = run_started_at
     validation_aborted = False
     accumulator = ResultAccumulator(run_dir, flush_interval=500)
 
-    with ProcessPoolExecutor(
-        max_workers=max_workers,
-        initializer=_init_gpu_process_worker,
-        initargs=(val_run_payload, 1, 1),
-    ) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_task_id = {}
         job_table = {}
 
         for j in jobs:
             task_id = uuid.uuid4().hex
-            future = executor.submit(_execute_gpu_job_in_process, j, task_id)
+            future = executor.submit(_execute_gpu_job, validation_run, j, task_id)
             future_to_task_id[future] = task_id
             job_table[task_id] = j
             track_validation_task(validation_run, task_id)
@@ -1317,7 +1342,7 @@ def _run_with_gpu_batch(
                 elapsed_seconds = int(now - run_started_at)
                 eta = _format_eta(elapsed_seconds, completed_jobs, total_jobs)
                 grid_done = validation_run.ok_points + validation_run.error_points
-                __logger.info(
+                logger.info(
                     "Heartbeat validation %s (GPU): elapsed=%ss progress=%s%% jobs_completed=%s/%s "
                     "grid_points=%s/%s eta=%s pending=%s",
                     validation_run.id,
@@ -1335,7 +1360,7 @@ def _run_with_gpu_batch(
                     free_bytes, total_bytes = gpu_backend.mem_info()
                     used_mb = (total_bytes - free_bytes) / 1024 / 1024
                     total_mb = total_bytes / 1024 / 1024
-                    __logger.info(
+                    logger.info(
                         "GPU memory: used=%.0fMB total=%.0fMB free=%.0fMB",
                         used_mb,
                         total_mb,
@@ -1346,7 +1371,7 @@ def _run_with_gpu_batch(
             if not done:
                 if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
                     validation_aborted = True
-                    __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
+                    logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
                 continue
 
             for future in done:
@@ -1358,31 +1383,13 @@ def _run_with_gpu_batch(
                     if validation_aborted:
                         validation_run.error_points += num_gpis_from_job(job_table[task_id])
                     else:
-                        wrapped = future.result()
-                        status = wrapped["_status"]
-                        result = wrapped["result"]
-                        numgpis = wrapped["_numgpis"]
-
-                        if status == "error":
-                            validation_run.error_points += numgpis
-                            __logger.error(
-                                "GPU job %s failed after all retries (%s: %s).",
-                                task_id,
-                                wrapped.get("error_type", "Unknown"),
-                                wrapped.get("error_msg", "")[:120],
-                            )
-                        else:
-                            validation_run.ok_points += numgpis
-                            if result:
-                                res = _process_job_result_dict(
-                                    task_id, result, job_table, validation_run, run_dir, accumulator
-                                )
-                                if res is not None:
-                                    last_results = res
+                        res = _process_job_result(task_id, future, job_table, validation_run, run_dir, accumulator)
+                        if res is not None:
+                            last_results = res
 
                 except Exception as e:
                     validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                    __logger.error(
+                    logger.error(
                         "GPU job %s failed after all retries (%s: %s).",
                         task_id,
                         type(e).__name__,
@@ -1407,7 +1414,7 @@ def _run_with_gpu_batch(
 
 
 def run_validation(validation_run: ValidationRun, val_run_payload: dict | None = None):
-    __logger.info(f"Starting validation: {validation_run.id}")
+    logger.info(f"Starting validation: {validation_run.id}")
     validation_aborted = False
 
     try:
@@ -1427,10 +1434,10 @@ def run_validation(validation_run: ValidationRun, val_run_payload: dict | None =
             batch_size=batch_size,
         )
         validation_run.total_points = total_points
-        __logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
+        logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
 
         executor_type, max_workers = _determine_executor(jobs, ref_reader)
-        __logger.info(
+        logger.info(
             "Running validation %s with %s %s workers.",
             validation_run.id,
             max_workers,
@@ -1480,14 +1487,14 @@ def run_validation(validation_run: ValidationRun, val_run_payload: dict | None =
             _post_process_run(validation_run, run_dir, last_results)
 
     except Exception:
-        __logger.exception(f"Unexpected exception during validation {validation_run}:")
+        logger.exception(f"Unexpected exception during validation {validation_run}:")
 
     finally:
         cache = get_ts_cache()
         stats = cache.stats()
         if stats["hits"] + stats["misses"] > 0:
             hit_rate = stats["hits"] / (stats["hits"] + stats["misses"]) * 100
-            __logger.info(
+            logger.info(
                 "TS cache stats: hits=%s misses=%s evictions=%s hit_rate=%.1f%% size=%.1fMB entries=%s",
                 stats["hits"],
                 stats["misses"],
@@ -1497,7 +1504,7 @@ def run_validation(validation_run: ValidationRun, val_run_payload: dict | None =
                 stats["entries"],
             )
         validation_run.end_time = datetime.now(tzlocal())
-        __logger.info(
+        logger.info(
             f"Validation finished: {validation_run}. "
             f"Jobs: {validation_run.total_points}, "
             f"Errors: {validation_run.error_points}, "
@@ -1632,8 +1639,8 @@ def define_tsw_metrics(
 
     temp_sub_wdws = temp_sub_wdw_instance.custom_temporal_sub_windows if temp_sub_wdw_instance else None
 
-    __logger.debug(f"{temp_sub_wdw_instance=}")
-    __logger.debug(f"{temp_sub_wdws=}")
+    logger.debug(f"{temp_sub_wdw_instance=}")
+    logger.debug(f"{temp_sub_wdws=}")
     return {
         "temp_sub_wdw_instance": temp_sub_wdw_instance,
         "temp_sub_wdws": temp_sub_wdws,
