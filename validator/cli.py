@@ -153,6 +153,32 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional override for parallel worker count used by validation.",
     )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Disable GPU acceleration even if CuPy and a device are available.",
+    )
+    parser.add_argument(
+        "--gpu-device",
+        type=int,
+        default=None,
+        dest="gpu_device",
+        help="CUDA device id to use for GPU validation (default: 0).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        dest="batch_size",
+        help="Number of grid points per GPU batch (default: 1000).",
+    )
+    parser.add_argument(
+        "--cache-size-mb",
+        type=int,
+        default=None,
+        dest="cache_size_mb",
+        help="GPU cache size in MiB (default: 2048).",
+    )
     return parser
 
 
@@ -264,6 +290,21 @@ def main(argv: list[str] | None = None) -> int:
 
             settings.MAX_PARALLEL_WORKERS = args.max_workers
             LOGGER.info("Overriding MAX_PARALLEL_WORKERS to %s", settings.MAX_PARALLEL_WORKERS)
+
+        if args.no_gpu:
+            from validator import settings as _s
+
+            _s.GPU_ENABLED = False
+            LOGGER.info("GPU acceleration disabled via --no-gpu.")
+        else:
+            from validator import settings as _s
+
+            if args.gpu_device is not None:
+                _s.GPU_DEVICE_ID = args.gpu_device
+            if args.batch_size is not None:
+                _s.GPU_BATCH_SIZE = args.batch_size
+            if args.cache_size_mb is not None:
+                _s.GPU_CACHE_SIZE_MB = args.cache_size_mb
 
         with config_path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
