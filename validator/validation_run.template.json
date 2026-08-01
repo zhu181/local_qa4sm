@@ -13,6 +13,10 @@
     "plots_save_metadata": "threshold",
     "intra_annual_metrics": false,
     "stability_metrics": false,
+    "gpu": false,
+    "gpu_device": 0,
+    "batch_size": 1000,
+    "cache_size_mb": 2048,
 
     "dataset_configurations": [
       {

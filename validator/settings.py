@@ -13,3 +13,9 @@ if MAX_PARALLEL_WORKERS < 1:
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("QA4SM_HEARTBEAT_INTERVAL_SECONDS", "60"))
 if HEARTBEAT_INTERVAL_SECONDS < 1:
     HEARTBEAT_INTERVAL_SECONDS = 1
+
+# GPU acceleration flags (can be overridden by CLI / config).
+GPU_ENABLED: bool = os.getenv("QA4SM_GPU_ENABLED", "").lower() in ("1", "true", "yes")
+GPU_DEVICE_ID: int = int(os.getenv("QA4SM_GPU_DEVICE_ID", "0"))
+GPU_BATCH_SIZE: int = int(os.getenv("QA4SM_GPU_BATCH_SIZE", "1000"))
+GPU_CACHE_SIZE_MB: int = int(os.getenv("QA4SM_GPU_CACHE_SIZE_MB", "2048"))
