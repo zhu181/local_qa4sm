@@ -1,6 +1,6 @@
 import os
 
-MEDIA_ROOT = os.path.join(os.path.dirname(__file__), "media")
+MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs"))
 DEFAULT_PARALLEL_WORKERS = os.cpu_count() or 1
 
 # Configure max number of local workers used in run_validation.

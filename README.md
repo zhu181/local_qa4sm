@@ -78,7 +78,7 @@ uv run ruff format .
 uv run mypy validator
 ```
 
-Output directory: `validator/media/` (controlled by `validator/settings.py:MEDIA_ROOT`).
+Output directory: `outputs/` (controlled by `validator/settings.py:MEDIA_ROOT`).
 Stale `.nc` files from previous runs are auto-cleaned on re-run.
 
 ## License
