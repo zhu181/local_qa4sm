@@ -13,3 +13,7 @@ if MAX_PARALLEL_WORKERS < 1:
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("QA4SM_HEARTBEAT_INTERVAL_SECONDS", "60"))
 if HEARTBEAT_INTERVAL_SECONDS < 1:
     HEARTBEAT_INTERVAL_SECONDS = 1
+
+# Run validation through the Dask-parallel GPU path (pytesmo[gpu]).
+# Falls back to the classic threaded path if no GPU/CuPy is available.
+USE_GPU = os.getenv("QA4SM_USE_GPU", "0") == "1"

@@ -1,0 +1,3 @@
+[submodule "pytesmo"]
+	path = pytesmo
+	url = https://github.com/zhu181/pytesmo

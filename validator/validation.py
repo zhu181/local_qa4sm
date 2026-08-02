@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 import netCDF4
+import numpy as np
 import pandas as pd
 import pytz
 from dateutil.tz import tzlocal
@@ -488,6 +489,7 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
                 rename_cols=False,
                 only_with_reference=True,
                 handle_errors="ignore",
+                use_gpu=settings.USE_GPU,
             )
             end_time = datetime.now(tzlocal())
             duration = end_time - start_time
@@ -668,9 +670,171 @@ def _determine_max_workers(jobs, ref_reader):
     return max_workers
 
 
+def _gpu_dask_requested() -> bool:
+    """True when QA4SM_USE_GPU is set AND a working GPU/CuPy is detected."""
+    if not getattr(settings, "USE_GPU", False):
+        return False
+    try:
+        from pytesmo.gpu import is_gpu_available
+
+        available = is_gpu_available()
+    except ImportError:
+        available = False
+    if not available:
+        __logger.warning(
+            "QA4SM_USE_GPU is set but no GPU/CuPy is available. Falling back to the classic threaded path on CPU."
+        )
+        settings.USE_GPU = False
+        return False
+    return True
+
+
+def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
+    """
+    Run the whole validation through a single pytesmo ``Validation.calc`` call
+    using the Dask-parallel GPU path.
+
+    All jobs are concatenated into one flat gpi/lon/lat (+ metadata) set and
+    processed by pytesmo's DaskParallelExecutor (1 GPU per worker), replacing
+    the classic ThreadPoolExecutor job loop.
+    """
+    all_gpis = np.concatenate([job[0] for job in jobs])
+    all_lons = np.concatenate([job[1] for job in jobs])
+    all_lats = np.concatenate([job[2] for job in jobs])
+
+    # ISMN jobs carry a 4th element: per-gpi metadata dicts; gridded jobs don't.
+    meta_list = []
+    for job in jobs:
+        if len(job) > 3:
+            meta_list.extend(job[3])
+        else:
+            meta_list.extend([{} for _ in range(len(job[0]))])
+
+    n_workers = getattr(settings, "MAX_PARALLEL_WORKERS", os.cpu_count() or 1)
+    __logger.info(
+        "Running validation %s with Dask-parallel GPU path (%s gpis, %s workers).",
+        validation_run.id,
+        len(all_gpis),
+        n_workers,
+    )
+
+    results = val.calc(
+        all_gpis,
+        all_lons,
+        all_lats,
+        meta_list,
+        rename_cols=False,
+        only_with_reference=True,
+        handle_errors="ignore",
+        use_gpu=True,
+        parallel="dask",
+        n_workers=n_workers,
+        batch_size=1000,
+        output_format="zarr",
+        progress=True,
+        parallel_kwargs={"dashboard": False},
+    )
+    if not results:
+        __logger.warning(f"GPU/Dask validation {validation_run.id} produced no results.")
+        return
+
+    results = _pytesmo_to_qa4sm_results(results)
+    ok_pts, error_pts = _count_job_status(results, len(all_gpis))
+    validation_run.ok_points += ok_pts
+    validation_run.error_points += error_pts
+    validation_run.progress = round(
+        (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
+    )
+    check_and_store_results(str(validation_run.id), results, run_dir)
+    _post_process_run(validation_run, run_dir, results)
+
+
+def _run_classic_validation(validation_run, jobs, run_dir, max_workers):
+    """Run the classic ThreadPoolExecutor job loop (per-job validation)."""
+    validation_aborted = False
+    __logger.info(f"Running validation {validation_run.id} with {max_workers} parallel workers.")
+    total_jobs = len(jobs)
+    run_started_at = time.monotonic()
+    last_heartbeat_at = run_started_at
+    heartbeat_interval = getattr(settings, "HEARTBEAT_INTERVAL_SECONDS", 60)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task_id = {}
+        job_table = {}
+        last_results = None
+
+        for j in jobs:
+            task_id = uuid.uuid4().hex
+            future = executor.submit(execute_job, validation_run, j, task_id)
+            future_to_task_id[future] = task_id
+            job_table[task_id] = j
+            track_validation_task(validation_run, task_id)
+
+        pending = set(future_to_task_id.keys())
+        while pending:
+            done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
+
+            now = time.monotonic()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                completed_jobs = total_jobs - len(pending)
+                elapsed_seconds = int(now - run_started_at)
+                __logger.info(
+                    "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s pending=%s",
+                    validation_run.id,
+                    elapsed_seconds,
+                    validation_run.progress,
+                    completed_jobs,
+                    total_jobs,
+                    len(pending),
+                )
+                last_heartbeat_at = now
+
+            if not done:
+                if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
+                    validation_aborted = True
+                    __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
+                continue
+
+            for future in done:
+                task_id = future_to_task_id[future]
+                try:
+                    if validation_task_cancelled(task_id):
+                        validation_aborted = True
+
+                    if validation_aborted:
+                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                    else:
+                        res = _process_job_result(task_id, future, job_table, validation_run, run_dir)
+                        if res is not None:
+                            last_results = res
+
+                except Exception as e:
+                    validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                    __logger.error(
+                        "Job %s failed after all retries (%s: %s).",
+                        task_id,
+                        type(e).__name__,
+                        str(e)[:120],
+                    )
+                    if validation_task_cancelled(task_id):
+                        validation_aborted = True
+                finally:
+                    if not validation_task_cancelled(task_id):
+                        untrack_validation_task(task_id)
+
+                if not validation_aborted:
+                    validation_run.progress = round(
+                        (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
+                    )
+                else:
+                    validation_run.progress = -1
+
+    if not validation_aborted and last_results is not None:
+        _post_process_run(validation_run, run_dir, last_results)
+
+
 def run_validation(validation_run: ValidationRun):
     __logger.info(f"Starting validation: {validation_run.id}")
-    validation_aborted = False
 
     try:
         run_dir = os.path.join(OUTPUT_FOLDER, str(validation_run.id))
@@ -686,86 +850,24 @@ def run_validation(validation_run: ValidationRun):
         validation_run.total_points = total_points
         __logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
 
-        max_workers = _determine_max_workers(jobs, ref_reader)
-        __logger.info(f"Running validation {validation_run.id} with {max_workers} parallel workers.")
-        total_jobs = len(jobs)
-        run_started_at = time.monotonic()
-        last_heartbeat_at = run_started_at
-        heartbeat_interval = getattr(settings, "HEARTBEAT_INTERVAL_SECONDS", 60)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task_id = {}
-            job_table = {}
-            last_results = None
-
-            for j in jobs:
-                task_id = uuid.uuid4().hex
-                future = executor.submit(execute_job, validation_run, j, task_id)
-                future_to_task_id[future] = task_id
-                job_table[task_id] = j
-                track_validation_task(validation_run, task_id)
-
-            pending = set(future_to_task_id.keys())
-            while pending:
-                done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
-
-                now = time.monotonic()
-                if now - last_heartbeat_at >= heartbeat_interval:
-                    completed_jobs = total_jobs - len(pending)
-                    elapsed_seconds = int(now - run_started_at)
-                    __logger.info(
-                        "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s pending=%s",
-                        validation_run.id,
-                        elapsed_seconds,
-                        validation_run.progress,
-                        completed_jobs,
-                        total_jobs,
-                        len(pending),
-                    )
-                    last_heartbeat_at = now
-
-                if not done:
-                    if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
-                        validation_aborted = True
-                        __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
-                    continue
-
-                for future in done:
-                    task_id = future_to_task_id[future]
-                    try:
-                        if validation_task_cancelled(task_id):
-                            validation_aborted = True
-
-                        if validation_aborted:
-                            validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                        else:
-                            res = _process_job_result(task_id, future, job_table, validation_run, run_dir)
-                            if res is not None:
-                                last_results = res
-
-                    except Exception as e:
-                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                        __logger.error(
-                            "Job %s failed after all retries (%s: %s).",
-                            task_id,
-                            type(e).__name__,
-                            str(e)[:120],
-                        )
-                        if validation_task_cancelled(task_id):
-                            validation_aborted = True
-                    finally:
-                        if not validation_task_cancelled(task_id):
-                            untrack_validation_task(task_id)
-
-                    if not validation_aborted:
-                        validation_run.progress = round(
-                            (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
-                        )
-                    else:
-                        validation_run.progress = -1
-
-        if not validation_aborted and last_results is not None:
-            _post_process_run(validation_run, run_dir, last_results)
+        if _gpu_dask_requested():
+            val = create_pytesmo_validation(validation_run)
+            try:
+                _run_gpu_dask_validation(validation_run, val, jobs, run_dir)
+            except Exception as e:
+                __logger.warning(
+                    "GPU/Dask path failed (%s: %s). Falling back to the classic threaded path with GPU metrics.",
+                    type(e).__name__,
+                    str(e)[:120],
+                )
+                validation_run.ok_points = 0
+                validation_run.error_points = 0
+                _clear_stale_outputs(run_dir)
+                max_workers = _determine_max_workers(jobs, ref_reader)
+                _run_classic_validation(validation_run, jobs, run_dir, max_workers)
+        else:
+            max_workers = _determine_max_workers(jobs, ref_reader)
+            _run_classic_validation(validation_run, jobs, run_dir, max_workers)
 
     except Exception:
         __logger.exception(f"Unexpected exception during validation {validation_run}:")

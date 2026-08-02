@@ -746,12 +746,6 @@ dependencies = [
     { name = "xarray" },
 ]
 
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -769,18 +763,15 @@ requires-dist = [
     { name = "pynetcf", specifier = ">=0.5.2" },
     { name = "pyqt5-qt5", specifier = "==5.15.2" },
     { name = "pytesmo", extras = ["gpu"], editable = "pytesmo" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytz", specifier = ">=2026.1.post1" },
     { name = "qa4sm-preprocessing" },
     { name = "qa4sm-reader" },
     { name = "rioxarray", specifier = ">=0.22.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
     { name = "scipy", specifier = ">=1.17.1" },
     { name = "setuptools", specifier = ">=83.0.0" },
     { name = "smap-io", specifier = ">=0.8" },
     { name = "xarray", specifier = ">=2026.2.0" },
 ]
-provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [
