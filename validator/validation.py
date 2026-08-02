@@ -689,6 +689,26 @@ def _gpu_dask_requested() -> bool:
     return True
 
 
+def _dask_memory_limit():
+    """Per-worker memory limit for the Dask GPU path.
+
+    Uses ``QA4SM_DASK_MEMORY_LIMIT`` (Dask-compatible string like "16GB") when
+    set, otherwise falls back to 60% of total system memory. Dask's default
+    "auto" (~40%) is too tight for memory-hungry readers and triggers
+    ``KilledWorker``.
+    """
+    limit = getattr(settings, "DASK_MEMORY_LIMIT", None)
+    if limit is not None:
+        return limit
+    try:
+        import psutil
+
+        total = psutil.virtual_memory().total
+    except Exception:
+        total = 32 * 1024**3
+    return int(0.6 * total)
+
+
 def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
     """
     Run the whole validation through a single pytesmo ``Validation.calc`` call
@@ -732,7 +752,7 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
         batch_size=1000,
         output_format="zarr",
         progress=True,
-        parallel_kwargs={"dashboard": False},
+        parallel_kwargs={"dashboard": False, "memory_limit": _dask_memory_limit()},
     )
     if not results:
         __logger.warning(f"GPU/Dask validation {validation_run.id} produced no results.")

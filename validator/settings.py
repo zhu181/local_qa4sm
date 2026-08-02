@@ -17,3 +17,9 @@ if HEARTBEAT_INTERVAL_SECONDS < 1:
 # Run validation through the Dask-parallel GPU path (pytesmo[gpu]).
 # Falls back to the classic threaded path if no GPU/CuPy is available.
 USE_GPU = os.getenv("QA4SM_USE_GPU", "0") == "1"
+
+# Memory limit for each Dask worker in the GPU/Dask path. Accepts a string
+# parsable by Dask (e.g. "16GB") or a plain byte count. If unset it defaults
+# to 60% of the total system memory, which is more generous than Dask's
+# conservative "auto" (~40%) and avoids KilledWorker on heavy readers.
+DASK_MEMORY_LIMIT = os.getenv("QA4SM_DASK_MEMORY_LIMIT", "") or None

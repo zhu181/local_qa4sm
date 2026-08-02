@@ -19,15 +19,17 @@
 
 ## CLI & env
 - `qa4sm-validate [config] [--dry-run] [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}] [--log-file PATH] [--max-workers N]`
-- Env: `QA4SM_MAX_PARALLEL_WORKERS` (default = CPU count), `QA4SM_HEARTBEAT_INTERVAL_SECONDS` (default 60), `QA4SM_USE_GPU`
+- Env: `QA4SM_MAX_PARALLEL_WORKERS` (default = CPU count), `QA4SM_HEARTBEAT_INTERVAL_SECONDS` (default 60), `QA4SM_USE_GPU`, `QA4SM_DASK_MEMORY_LIMIT` (Dask-compatible string like "16GB"; default 60% of system RAM)
 - Classic path: `ThreadPoolExecutor`; ISMN reference reader forces `max_workers=1` (not thread-safe)
 - Repetitive log/warning noise auto-suppressed after first 5 occurrences; pytesmo logger forced to CRITICAL
 
 ## GPU acceleration
 - pytesmo metrics auto-dispatch to CuPy when available (`_GPU_AVAILABLE` checked at import); no per-call wiring needed
 - `QA4SM_USE_GPU=1` switches to the Dask-parallel GPU path (single `Validation.calc(..., parallel="dask", use_gpu=True)`); if GPU/CuPy is unavailable it logs a warning and falls back to the classic threaded path
+- Dask worker `memory_limit` is set explicitly (default 60% of RAM) because Dask's `auto` (~40%) triggers `KilledWorker` on memory-hungry readers (e.g. `GriddedNcOrthoMultiTs` reads add ~1 GB RSS per gpi). Override via `QA4SM_DASK_MEMORY_LIMIT`
 - Root venv uses Python 3.13 + `cupy-cuda12x` (works on this machine: RTX 5070, CUDA 12.9). Never mix `cupy-cuda12x` and `cupy-cuda13x` — they share the `cupy` namespace dir
 - On this machine Dask auto-limits to 1 worker (1 GPU); the win is GPU-accelerated metric/bootstrap compute, not multi-worker parallelism
+- Verified on real data (SPL3SMPE x NSMCSMC, 121 points): Dask+GPU path runs end-to-end (~90 s), 121/121 ok, output netCDF + plots
 
 ## Dev
 - Python >=3.13, uv; dev deps are pytest + ruff only

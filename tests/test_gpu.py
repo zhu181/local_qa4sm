@@ -51,7 +51,8 @@ def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkey
     kwargs = fake.calls["kwargs"]
     assert kwargs["use_gpu"] is True
     assert kwargs["parallel"] == "dask"
-    assert kwargs["parallel_kwargs"] == {"dashboard": False}
+    assert kwargs["parallel_kwargs"]["dashboard"] is False
+    assert "memory_limit" in kwargs["parallel_kwargs"]
     assert kwargs["only_with_reference"] is True
     assert val_run.ok_points == 2
     assert val_run.error_points == 1
@@ -111,3 +112,18 @@ def test_gpu_dask_requested_enabled_when_gpu_available(monkeypatch):
     monkeypatch.setattr("pytesmo.gpu.is_gpu_available", lambda: True)
     assert validation._gpu_dask_requested() is True
     assert settings.USE_GPU is True
+
+
+def test_dask_memory_limit_uses_env_override(monkeypatch):
+    monkeypatch.setattr(settings, "DASK_MEMORY_LIMIT", "16GB")
+    assert validation._dask_memory_limit() == "16GB"
+
+
+def test_dask_memory_limit_defaults_to_fraction_of_ram(monkeypatch):
+    monkeypatch.setattr(settings, "DASK_MEMORY_LIMIT", None)
+    import sys
+
+    fake_psutil = types.SimpleNamespace(virtual_memory=lambda: types.SimpleNamespace(total=40 * 1024**3))
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    limit = validation._dask_memory_limit()
+    assert limit == int(0.6 * 40 * 1024**3)
