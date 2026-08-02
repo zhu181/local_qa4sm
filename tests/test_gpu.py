@@ -60,7 +60,7 @@ def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkey
     assert posted["a"][0] is val_run
 
 
-def test_run_gpu_dask_validation_returns_early_on_empty_results(monkeypatch):
+def test_run_gpu_dask_validation_raises_on_empty_results(monkeypatch):
     class EmptyVal:
         def calc(self, *args, **kwargs):
             return {}
@@ -68,7 +68,8 @@ def test_run_gpu_dask_validation_returns_early_on_empty_results(monkeypatch):
     not_called = mock.Mock()
     monkeypatch.setattr(validation, "_pytesmo_to_qa4sm_results", not_called)
     val_run = types.SimpleNamespace(id="run2", ok_points=0, error_points=0, progress=0, total_points=3)
-    validation._run_gpu_dask_validation(val_run, EmptyVal(), _jobs(), "/tmp/run")
+    with pytest.raises(RuntimeError, match="produced no results"):
+        validation._run_gpu_dask_validation(val_run, EmptyVal(), _jobs(), "/tmp/run")
     not_called.assert_not_called()
     assert val_run.ok_points == 0
 
@@ -117,6 +118,29 @@ def test_gpu_dask_requested_enabled_when_gpu_available(monkeypatch):
 def test_dask_memory_limit_uses_env_override(monkeypatch):
     monkeypatch.setattr(settings, "DASK_MEMORY_LIMIT", "16GB")
     assert validation._dask_memory_limit() == "16GB"
+
+
+def test_setup_metric_calculators_tcol_uses_prefixed_spatial_ref_name(monkeypatch):
+    captured = {}
+
+    class FakeTcol:
+        def __init__(self, refname, metadata_template=None, bootstrap_cis=False):
+            captured["refname"] = refname
+
+        def calc_metrics(self, data, gpi_info):
+            pass
+
+    monkeypatch.setattr(validation, "TripleCollocationMetrics", FakeTcol)
+    val_run = types.SimpleNamespace(
+        tcol=True,
+        bootstrap_tcol_cis=False,
+        intra_annual_metrics=False,
+        stability_metrics=False,
+    )
+    validation._setup_metric_calculators(
+        3, ["0-ISMN", "1-SPL3SMPE", "2-NSMCSMC"], val_run, {}, None, None, "0-ISMN"
+    )
+    assert captured["refname"] == "0-ISMN"
 
 
 def test_dask_memory_limit_defaults_to_fraction_of_ram(monkeypatch):

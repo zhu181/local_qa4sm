@@ -294,7 +294,7 @@ def _apply_anomaly_adapter(reader, validation_run, dataset_config, read_name):
 
 
 def _setup_metric_calculators(
-    ds_num, ds_names, validation_run, metadata_template, temp_sub_wdws, temp_sub_wdw_instance
+    ds_num, ds_names, validation_run, metadata_template, temp_sub_wdws, temp_sub_wdw_instance, spatial_ref_name
 ):
     _pairwise_metrics = PairwiseIntercomparisonMetrics(
         metadata_template=metadata_template,
@@ -325,7 +325,7 @@ def _setup_metric_calculators(
 
     if (len(ds_names) >= 3) and (validation_run.tcol is True):
         _tcol_metrics = TripleCollocationMetrics(
-            validation_run.spatial_reference_configuration.dataset.short_name,
+            spatial_ref_name,
             metadata_template=metadata_template,
             bootstrap_cis=validation_run.bootstrap_tcol_cis,
         )
@@ -442,6 +442,7 @@ def create_pytesmo_validation(validation_run: ValidationRun):
         metadata_template,
         temp_sub_wdws,
         temp_sub_wdw_instance,
+        spatial_ref_name,
     )
 
     scaling_method = (
@@ -756,7 +757,7 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
     )
     if not results:
         __logger.warning(f"GPU/Dask validation {validation_run.id} produced no results.")
-        return
+        raise RuntimeError("GPU/Dask path produced no results; falling back to the classic path.")
 
     results = _pytesmo_to_qa4sm_results(results)
     ok_pts, error_pts = _count_job_status(results, len(all_gpis))

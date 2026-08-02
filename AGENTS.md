@@ -27,9 +27,10 @@
 - pytesmo metrics auto-dispatch to CuPy when available (`_GPU_AVAILABLE` checked at import); no per-call wiring needed
 - `QA4SM_USE_GPU=1` switches to the Dask-parallel GPU path (single `Validation.calc(..., parallel="dask", use_gpu=True)`); if GPU/CuPy is unavailable it logs a warning and falls back to the classic threaded path
 - Dask worker `memory_limit` is set explicitly (default 60% of RAM) because Dask's `auto` (~40%) triggers `KilledWorker` on memory-hungry readers (e.g. `GriddedNcOrthoMultiTs` reads add ~1 GB RSS per gpi). Override via `QA4SM_DASK_MEMORY_LIMIT`
-- Root venv uses Python 3.13 + `cupy-cuda12x` (works on this machine: RTX 5070, CUDA 12.9). Never mix `cupy-cuda12x` and `cupy-cuda13x` — they share the `cupy` namespace dir
+- Root venv uses Python 3.13 + `cupy-cuda13x==14.1.1` (matches the installed CUDA 13.3 toolkit; the only `cublas64_12.dll` on this machine is a stale app bundle that fails to load, so `cupy-cuda12x` cannot do tcol/matmul). Never mix `cupy-cuda12x` and `cupy-cuda13x` — they share the `cupy` namespace dir
 - On this machine Dask auto-limits to 1 worker (1 GPU); the win is GPU-accelerated metric/bootstrap compute, not multi-worker parallelism
 - Verified on real data (SPL3SMPE x NSMCSMC, 121 points): Dask+GPU path runs end-to-end (~90 s), 121/121 ok, output netCDF + plots
+- ISMN presets (ISMN x SPL3SMPE x NSMCSMC, 68 stations, tcol=True) also verified end-to-end on both classic and Dask+GPU paths (41/41 ok on valid stations; remaining 27 = stations outside the 2017-2021 interval). Required fixes: tcol `refname` must be the prefixed spatial-ref name (`0-ISMN`), missing `frm_class` metadata filled with template defaults instead of raising, and stability-adapter status keys (`bulk|status`) recognized in pytesmo error paths
 
 ## Dev
 - Python >=3.13, uv; dev deps are pytest + ruff only
@@ -41,4 +42,4 @@
 ## Architecture notes
 - Entrypoint: `validator/cli.py:main`; flow: `orchestrator.parse_validation_run_config` → `validation.run_validation`
 - Models are in-memory dataclasses mimicking Django ORM: `ValidationTask.objects.filter()/.get()/.save()/.delete()` (no DB)
-- Output dir: `validator/media/` (`settings.py:MEDIA_ROOT`); stale `.nc` files in run dir auto-cleaned on re-run
+- Output dir: `outputs/` (`settings.py:MEDIA_ROOT`); stale `.nc` files in run dir auto-cleaned on re-run
