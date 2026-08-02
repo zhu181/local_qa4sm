@@ -3,10 +3,11 @@
 ## Quick start
 - Run: `uv run qa4sm-validate <config.json>` (config arg optional; defaults to `validator/validation_run.template.json`)
 - Or: `uv run python -m validator.cli <config.json>`; dry-run: `--dry-run`
-- Windows helper: `.\run_validation.ps1 [<preset>] [-Config PATH] [-BBox lat0,lon0,lat1,lon1] [-Gpu] [-MemoryLimit SIZE] [-Heartbeat SEC] [-EnvVar NAME=value] [-DryRun] [-LogLevel X] [-MaxWorkers N] [-Interactive]` (uses `.venv\Scripts\python.exe`)
+- Windows helper: `.\run_validation.ps1 [<preset>] [-Config PATH] [-BBox lat0,lon0,lat1,lon1] [-Gpu] [-MemoryLimit SIZE] [-Heartbeat SEC] [-EnvVar NAME=value] [-DryRun] [-LogLevel X] [-LogFile PATH] [-MaxWorkers N] [-Interactive]` (uses `.venv\Scripts\python.exe`)
   - Preset names are fuzzy-matched against `presets/validation_run.*.json` (e.g. `ismn-spl3`, `spl3smpe`); `-List` shows them
   - `-BBox` overlays `min_lat/min_lon/max_lat/max_lon` onto a temp copy (keeps full-preset runs small/fast) and deletes it after a real run
   - `-Gpu` sets `QA4SM_USE_GPU=1`; `-MemoryLimit` sets `QA4SM_DASK_MEMORY_LIMIT` (e.g. `16GB`); `-Heartbeat` sets `QA4SM_HEARTBEAT_INTERVAL_SECONDS`; `-EnvVar` is a repeatable `NAME=value` passthrough; unset vars are cleared so no stale env leaks between runs; `-Config` still accepted for explicit paths
+  - Every invocation writes a timestamped log to `logs\validation_run_<ts>.log` by default (script-level events + validation output in one file; dry-runs too) unless `-LogFile` overrides it; script prints the path at the end
   - `-Interactive` prompts through preset/bbox/GPU/memory/dry-run choices (GPU defaults ON) then confirms before running
 
 ## Repo layout

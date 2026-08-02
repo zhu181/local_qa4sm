@@ -52,7 +52,7 @@ function Show-Usage {
     Write-Host "                     Set any extra env var for the run (repeatable)"
     Write-Host "  -DryRun            Parse and print the config without running it"
     Write-Host "  -LogLevel <level>  DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO)"
-    Write-Host "  -LogFile <path>    Write logs to a file"
+    Write-Host "  -LogFile <path>    Write logs to a file (default: auto-created in logs\)"
     Write-Host "  -MaxWorkers <n>    Number of parallel workers"
     Write-Host "  -List              Show this help"
     Write-Host "  -Interactive       Prompt for preset, bbox, GPU, etc. (GPU defaults to ON)"
@@ -69,6 +69,48 @@ if ($List) {
     Show-Usage
     exit 0
 }
+
+# --- logging setup -----------------------------------------------------------
+$script:activeLogFile = ""
+$autoLog = $false
+if ($LogFile -eq "") {
+    $logsDir = Join-Path $PSScriptRoot "logs"
+    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $LogFile = Join-Path $logsDir ("validation_run_{0}.log" -f $stamp)
+    $n = 1
+    while (Test-Path -LiteralPath $LogFile) {
+        $LogFile = Join-Path $logsDir ("validation_run_{0}_{1}.log" -f $stamp, (++$n))
+    }
+    $autoLog = $true
+} elseif ($LogFile -ne "" -and (Split-Path -Parent $LogFile)) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $LogFile) -Force | Out-Null
+}
+$script:activeLogFile = $LogFile
+
+function Write-Log {
+    param([string]$Message)
+    $line = "{0} | {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    if ($script:activeLogFile) {
+        Add-Content -LiteralPath $script:activeLogFile -Value $line -Encoding utf8
+    }
+    Write-Host $line
+}
+
+Write-Log "=== run_validation.ps1 start ==="
+Write-Log ("  Preset     : {0}" -f $(if ($Preset) { $Preset } else { "(default)" }))
+Write-Log ("  Config     : {0}" -f $(if ($Config) { $Config } else { "(none)" }))
+Write-Log ("  BBox       : {0}" -f $(if ($BBox) { "$BBox" } else { "(none)" }))
+Write-Log ("  Gpu        : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
+Write-Log ("  MemoryLimit: {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "(default 60% RAM)" }))
+Write-Log ("  Heartbeat  : {0}" -f $(if ($Heartbeat -gt 0) { $Heartbeat } else { "(default 60)" }))
+Write-Log ("  EnvVar     : {0}" -f $(if ($EnvVar.Count) { ($EnvVar -join "; ") } else { "(none)" }))
+Write-Log ("  LogLevel   : {0}" -f $LogLevel)
+Write-Log ("  LogFile    : {0}" -f $LogFile)
+Write-Log ("  MaxWorkers : {0}" -f $(if ($MaxWorkers -gt 0) { $MaxWorkers } else { "(default)" }))
+Write-Log ("  DryRun     : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
+Write-Log ("  Interactive: {0}" -f $(if ($Interactive) { "yes" } else { "no" }))
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 # --- interactive mode -------------------------------------------------------
 function Read-Input {
@@ -131,16 +173,16 @@ if ($Interactive) {
         $DryRun = Ask-YesNo -Prompt "Dry-run (parse only)?" -Default $false
 
         Write-Host ""
-        Write-Host "---- Summary ----"
-        Write-Host ("  Preset : {0}" -f $Preset)
-        Write-Host ("  BBox   : {0}" -f $(if ($BBox) { $BBox } else { "(none - full)" }))
-        Write-Host ("  GPU    : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
-        Write-Host ("  Memory : {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "default (60% RAM)" }))
-        Write-Host ("  DryRun : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
+        Write-Log "---- Summary ----"
+        Write-Log ("  Preset : {0}" -f $Preset)
+        Write-Log ("  BBox   : {0}" -f $(if ($BBox) { $BBox } else { "(none - full)" }))
+        Write-Log ("  GPU    : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
+        Write-Log ("  Memory : {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "default (60% RAM)" }))
+        Write-Log ("  DryRun : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
         Write-Host "-----------------"
         $choice = Read-Input -Prompt "Run / Change / Quit (r/c/q) "
         if ($choice -and $choice.Trim().ToLowerInvariant() -in @("q", "quit")) {
-            Write-Host "Aborted."
+            Write-Log "Interactive: aborted by user."
             exit 0
         }
     } while ($choice -and $choice.Trim().ToLowerInvariant() -in @("c", "change"))
@@ -178,10 +220,12 @@ if ($Config -ne "") {
             if ($matches.Count -eq 1) {
                 $runConfig = $matches[0].FullName
             } elseif ($matches.Count -gt 1) {
+                Write-Log "ERROR: Preset '$Preset' is ambiguous. Matches: $($matches.BaseName -join ', ')"
                 Write-Error "Preset '$Preset' is ambiguous. Matches: $($matches.BaseName -join ', ')"
                 Show-Usage
                 exit 1
             } else {
+                Write-Log "ERROR: Preset '$Preset' not found."
                 Write-Error "Preset '$Preset' not found."
                 Show-Usage
                 exit 1
@@ -192,7 +236,10 @@ if ($Config -ne "") {
     $runConfig = $defaultConfig
 }
 
+Write-Log "Resolved config: $runConfig"
+
 if (-not (Test-Path -LiteralPath $runConfig)) {
+    Write-Log "ERROR: Config not found: $runConfig"
     Write-Error "Config not found: $runConfig"
     exit 1
 }
@@ -202,12 +249,14 @@ if ($null -ne $BBox -and $BBox -ne "") {
     if ($BBox -is [array]) { $BBox = ($BBox -join ",") }
     $bbox = @($BBox.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
     if ($bbox.Count -ne 4) {
+        Write-Log "ERROR: -BBox needs exactly 4 numbers: <min_lat,min_lon,max_lat,max_lon> (got: '$BBox')"
         Write-Error "-BBox needs exactly 4 numbers: <min_lat,min_lon,max_lat,max_lon> (got: '$BBox')"
         exit 1
     }
     $valid = $true
     foreach ($v in $bbox) { if (-not ($v -match "^-?[\d.]+$")) { $valid = $false } }
     if (-not $valid) {
+        Write-Log "ERROR: -BBox needs 4 numbers, got: '$BBox'"
         Write-Error "-BBox needs 4 numbers, got: '$BBox'"
         exit 1
     }
@@ -215,6 +264,7 @@ if ($null -ne $BBox -and $BBox -ne "") {
     try {
         $cfg = Get-Content -Raw -LiteralPath $runConfig | ConvertFrom-Json -Depth 30
     } catch {
+        Write-Log "ERROR: Failed to parse config: $runConfig ($($_.Exception.Message))"
         Write-Error "Failed to parse config: $runConfig ($($_.Exception.Message))"
         exit 1
     }
@@ -233,6 +283,7 @@ if ($null -ne $BBox -and $BBox -ne "") {
     $cfg | ConvertTo-Json -Depth 30 | Set-Content -Encoding utf8 -LiteralPath $bboxConfig
     $runConfig = $bboxConfig
     $usedBBox = $true
+    Write-Log "BBox overlay applied: $($bbox -join ',') -> $bboxConfig"
 }
 
 # --- run --------------------------------------------------------------------
@@ -246,36 +297,50 @@ if ($MaxWorkers -gt 0) { $cliArgs += @("--max-workers", $MaxWorkers) }
 # --- environment -------------------------------------------------------------
 if ($Gpu) {
     $env:QA4SM_USE_GPU = "1"
+    Write-Log "ENV QA4SM_USE_GPU=1"
 } else {
     Remove-Item Env:QA4SM_USE_GPU -ErrorAction SilentlyContinue
 }
 if ($MemoryLimit -ne "") {
     $env:QA4SM_DASK_MEMORY_LIMIT = $MemoryLimit
+    Write-Log "ENV QA4SM_DASK_MEMORY_LIMIT=$MemoryLimit"
 } else {
     Remove-Item Env:QA4SM_DASK_MEMORY_LIMIT -ErrorAction SilentlyContinue
 }
 if ($Heartbeat -gt 0) {
     $env:QA4SM_HEARTBEAT_INTERVAL_SECONDS = "$Heartbeat"
+    Write-Log "ENV QA4SM_HEARTBEAT_INTERVAL_SECONDS=$Heartbeat"
 } else {
     Remove-Item Env:QA4SM_HEARTBEAT_INTERVAL_SECONDS -ErrorAction SilentlyContinue
 }
 foreach ($kv in $EnvVar) {
     $eq = $kv.IndexOf("=")
     if ($eq -le 0) {
+        Write-Log "ERROR: -EnvVar needs NAME=value, got: '$kv'"
         Write-Error "-EnvVar needs NAME=value, got: '$kv'"
         exit 1
     }
     Set-Item -Path ("Env:" + $kv.Substring(0, $eq)) -Value $kv.Substring($eq + 1)
+    Write-Log "ENV $($kv.Substring(0, $eq))=$($kv.Substring($eq + 1))"
 }
 
-Write-Host "Running: $runConfig"
-if ($Gpu) { Write-Host "  GPU/Dask path enabled" }
+Write-Log "Running: $runConfig"
+if ($Gpu) { Write-Log "  GPU/Dask path enabled" }
+Write-Log ("Executing: {0} {1}" -f $python, ($cliArgs -join " "))
 
 & $python @cliArgs
 $code = $LASTEXITCODE
 
 if ($usedBBox -and -not $DryRun) {
     Remove-Item -LiteralPath $runConfig -ErrorAction SilentlyContinue
+}
+
+$sw.Stop()
+Write-Log ("=== run_validation.ps1 finished: exit={0} elapsed={1} ===" -f $code, $sw.Elapsed.ToString("hh\:mm\:ss"))
+Write-Log "Log file: $LogFile"
+if ($autoLog) {
+    Write-Host ""
+    Write-Host "Log written to: $LogFile"
 }
 
 exit $code
