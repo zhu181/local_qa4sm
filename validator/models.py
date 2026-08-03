@@ -8,7 +8,7 @@ from typing import ClassVar, Optional
 class DatasetConfiguration:
     # validator.models.validation_run.ValidationRun
     id: int
-    validation: "ValidationRun"
+    validation: "ValidationRun" = field(repr=False)
     dataset: "Dataset"
     version: "DatasetVersion"
     variable: "DataVariable"
@@ -49,7 +49,7 @@ class DataVariable:
 @dataclass
 class ParametrisedFilter:
     id: int = 0
-    dataset_config: Optional["DatasetConfiguration"] = None
+    dataset_config: Optional["DatasetConfiguration"] = field(default=None, repr=False)
     filter: Optional["DataFilter"] = None
     parameters: str = ""
 

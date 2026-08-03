@@ -103,6 +103,37 @@ def test_config_hash_stable_and_config_sensitive():
     assert validation._config_hash(base) != h1
 
 
+def test_config_hash_stable_with_backref_models():
+    from validator.models import (
+        Dataset,
+        DatasetConfiguration,
+        DatasetVersion,
+        DataVariable,
+        ValidationRun,
+    )
+
+    def make(ds_short_name):
+        run = ValidationRun(id="some-run-uuid", name_tag="x")
+        ds = Dataset(
+            id=1, short_name=ds_short_name, pretty_name="D", help_text="",
+            detailed_description="", source_reference="", citation="",
+        )
+        ver = DatasetVersion(id=1, short_name="v1", pretty_name="V1", help_text="")
+        var = DataVariable(id=1, short_name="sm", pretty_name="SM", help_text="", unit="m3/m3")
+        dc = DatasetConfiguration(
+            id=1, validation=run, dataset=ds, version=ver, variable=var,
+            filters=[], parametrised_filters=[], is_spatial_reference=True,
+        )
+        run.dataset_configurations = [dc]
+        return run
+
+    h1 = validation._config_hash(make("smap"))
+    # same config but a different run id -> identical hash (resume keying)
+    assert validation._config_hash(make("smap")) == h1
+    # config change (dataset short_name) -> different hash
+    assert validation._config_hash(make("ismn")) != h1
+
+
 def test_execute_job_passes_use_gpu_from_settings(monkeypatch):
     monkeypatch.setattr(settings, "USE_GPU", True)
     fake = _RecordingVal()

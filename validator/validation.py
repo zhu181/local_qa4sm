@@ -611,11 +611,43 @@ def _process_job_result(task_id, future, job_table, validation_run, run_dir):
     return results
 
 
+def _extend_transcriber_datasets(validation_run):
+    """
+    Extend the qa4sm_reader transcriber's hard-coded DATASETS list with the
+    dataset short names actually used in this run.
+
+    Pytesmo2Qa4smResultsTranscriber.is_valid_tcol_metric_name() only accepts
+    tcol metric names whose ``{number}-{dataset}`` prefix matches a dataset in
+    the static ``qa4sm_reader.globals.DATASETS`` list. Datasets not in that list
+    (e.g. SPL3SMPE, NSMCSMC) would have their tcol metrics (beta/snr/err_std)
+    silently dropped during transcription. Patching the ``netcdf_transcription``
+    module namespace (the one the method reads at call time) fixes that.
+    """
+    try:
+        import qa4sm_reader.netcdf_transcription as qa4sm_transcription
+    except ImportError:
+        return
+
+    short_names = {validation_run.spatial_reference_configuration.dataset.short_name}
+    for cfg in validation_run.dataset_configurations:
+        short_names.add(cfg.dataset.short_name)
+
+    new_datasets = [name for name in sorted(short_names) if name not in qa4sm_transcription.DATASETS]
+    if new_datasets:
+        qa4sm_transcription.DATASETS = qa4sm_transcription.DATASETS + new_datasets
+        __logger.info(
+            "Extended qa4sm_reader transcriber DATASETS with %s so tcol metrics are kept for all datasets.",
+            new_datasets,
+        )
+
+
 def _post_process_run(validation_run, run_dir, results):
     set_outfile(validation_run, run_dir)
     iam_dict = define_tsw_metrics(validation_run, get_period(validation_run))
     temp_sub_wdw_instance = iam_dict["temp_sub_wdw_instance"]
     temp_sub_wdws = iam_dict["temp_sub_wdws"]
+
+    _extend_transcriber_datasets(validation_run)
 
     transcriber = Pytesmo2Qa4smResultsTranscriber(
         pytesmo_results=os.path.join(OUTPUT_FOLDER, validation_run.output_file),
@@ -724,13 +756,19 @@ _RUNTIME_FIELDS = {
 def _config_hash(validation_run) -> str:
     """Stable hash of the validation config for resume-cache keying.
 
-    Excludes run-specific/runtime fields (id, point counters, output file) so
-    that re-running the *same* config reuses the same Dask batch cache while any
-    config change (datasets, interval, bbox, metrics) starts a fresh one.
+    Excludes run-specific/runtime fields (id, point counters, output file) and
+    any callable/back-reference attributes (e.g. bound `save` methods, parent
+    run back-refs) so that re-running the *same* config reuses the same Dask
+    batch cache while any config change (datasets, interval, bbox, metrics)
+    starts a fresh one.
     """
     import hashlib
 
-    data = {k: v for k, v in vars(validation_run).items() if k not in _RUNTIME_FIELDS}
+    data = {
+        k: v
+        for k, v in vars(validation_run).items()
+        if k not in _RUNTIME_FIELDS and not callable(v)
+    }
     return hashlib.sha1(repr(data).encode("utf-8")).hexdigest()[:16]
 
 
@@ -846,30 +884,47 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
             state["key"] = next(iter(converted))
 
     progress_cb = _make_gpu_progress_callback(validation_run)
-    summary = val.calc(
-        all_gpis,
-        all_lons,
-        all_lats,
-        meta_list,
-        rename_cols=False,
-        only_with_reference=True,
-        handle_errors="ignore",
-        use_gpu=True,
-        parallel="dask",
-        n_workers=n_workers,
-        batch_size=100,
-        output_format="zarr",
-        output_path=_dask_batch_cache_path(validation_run),
-        progress=True,
-        progress_callback=progress_cb,
-        batch_callback=_batch_cb,
-        parallel_kwargs={
-            "dashboard": False,
-            "memory_limit": _dask_memory_limit(),
-            "memory_target_fraction": 0.6,
-            "memory_spill_fraction": 0.55,
-        },
-    )
+    try:
+        summary = val.calc(
+            all_gpis,
+            all_lons,
+            all_lats,
+            meta_list,
+            rename_cols=False,
+            only_with_reference=True,
+            handle_errors="ignore",
+            use_gpu=True,
+            parallel="dask",
+            n_workers=n_workers,
+            batch_size=100,
+            output_format="zarr",
+            output_path=_dask_batch_cache_path(validation_run),
+            progress=True,
+            progress_callback=progress_cb,
+            batch_callback=_batch_cb,
+            parallel_kwargs={
+                "dashboard": False,
+                "memory_limit": _dask_memory_limit(),
+                "memory_target_fraction": 0.6,
+                "memory_spill_fraction": 0.55,
+            },
+        )
+    except Exception as e:
+        # A failure after every gpi has already been computed and streamed to the
+        # output netCDF (e.g. a Dask cluster-teardown timeout) must not trigger
+        # the classic-path fallback, which would discard the finished results.
+        processed = state["ok"] + state["error"]
+        if state["seen"] and processed == len(all_gpis):
+            __logger.warning(
+                "GPU/Dask validation %s already processed all %d gpis before %s during "
+                "teardown; treating the run as successful.",
+                validation_run.id,
+                processed,
+                type(e).__name__,
+            )
+            summary = {"n_gpis": processed, "batches": 0, "keys": []}
+        else:
+            raise
     if not summary or summary.get("n_gpis", 0) == 0:
         __logger.warning(f"GPU/Dask validation {validation_run.id} produced no results.")
         raise RuntimeError("GPU/Dask path produced no results; falling back to the classic path.")
