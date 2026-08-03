@@ -122,7 +122,7 @@ function Read-Input {
     return (Read-Host $Prompt)
 }
 
-function Ask-YesNo {
+function Confirm-YesNo {
     param([string]$Prompt, [bool]$Default)
     $suffix = if ($Default) { "[Y/n]" } else { "[y/N]" }
     $answer = Read-Input -Prompt "$Prompt $suffix "
@@ -130,7 +130,7 @@ function Ask-YesNo {
     return ($answer.Trim().ToLowerInvariant() -in @("y", "yes"))
 }
 
-function Ask-Preset {
+function Confirm-Preset {
     Write-Host ""
     Write-Host "Available presets:"
     for ($i = 0; $i -lt $presetFiles.Count; $i++) {
@@ -149,10 +149,10 @@ function Ask-Preset {
 
 if ($Interactive) {
     do {
-        $Preset = Ask-Preset
+        $Preset = Confirm-Preset
 
         $BBox = ""
-        if (Ask-YesNo -Prompt "Limit to a bounding box?" -Default $false) {
+        if (Confirm-YesNo -Prompt "Limit to a bounding box?" -Default $false) {
             for ($i = 0; $i -lt 3; $i++) {
                 $BBox = Read-Input -Prompt "  min_lat,min_lon,max_lat,max_lon (e.g. 41,-114,44,-112) "
                 $parts = @($BBox.Split(",") | ForEach-Object { $_.Trim() })
@@ -164,13 +164,13 @@ if ($Interactive) {
             }
         }
 
-        $Gpu = Ask-YesNo -Prompt "Use GPU/Dask path?" -Default $true
+        $Gpu = Confirm-YesNo -Prompt "Use GPU/Dask path?" -Default $true
 
         $MemoryLimit = ""
         $mem = Read-Input -Prompt "Dask memory limit (Enter for default 60% RAM, e.g. 16GB) "
         if ($mem -ne "") { $MemoryLimit = $mem }
 
-        $DryRun = Ask-YesNo -Prompt "Dry-run (parse only)?" -Default $false
+        $DryRun = Confirm-YesNo -Prompt "Dry-run (parse only)?" -Default $false
 
         Write-Host ""
         Write-Log "---- Summary ----"
@@ -209,19 +209,19 @@ if ($Config -ne "") {
         if (Test-Path -LiteralPath $exact) {
             $runConfig = $exact
         } else {
-            $matches = @($presetFiles | Where-Object {
+            $matches1 = @($presetFiles | Where-Object {
                 ($_.BaseName -replace "^validation_run[_.]?", "").ToLowerInvariant() -contains $query
             })
-            if ($matches.Count -eq 0) {
-                $matches = @($presetFiles | Where-Object {
+            if ($matches1.Count -eq 0) {
+                $matches1 = @($presetFiles | Where-Object {
                     $_.BaseName -match $query
                 })
             }
-            if ($matches.Count -eq 1) {
-                $runConfig = $matches[0].FullName
-            } elseif ($matches.Count -gt 1) {
-                Write-Log "ERROR: Preset '$Preset' is ambiguous. Matches: $($matches.BaseName -join ', ')"
-                Write-Error "Preset '$Preset' is ambiguous. Matches: $($matches.BaseName -join ', ')"
+            if ($matches1.Count -eq 1) {
+                $runConfig = $matches1[0].FullName
+            } elseif ($matches1.Count -gt 1) {
+                Write-Log "ERROR: Preset '$Preset' is ambiguous. Matches: $($matches1.BaseName -join ', ')"
+                Write-Error "Preset '$Preset' is ambiguous. Matches: $($matches1.BaseName -join ', ')"
                 Show-Usage
                 exit 1
             } else {
@@ -302,8 +302,13 @@ if ($Gpu) {
     Remove-Item Env:QA4SM_USE_GPU -ErrorAction SilentlyContinue
 }
 if ($MemoryLimit -ne "") {
-    $env:QA4SM_DASK_MEMORY_LIMIT = $MemoryLimit
-    Write-Log "ENV QA4SM_DASK_MEMORY_LIMIT=$MemoryLimit"
+    $normalizedMem = $MemoryLimit
+    if ($MemoryLimit -match '^\d+$') {
+        $normalizedMem = "${MemoryLimit}GB"
+        Write-Log "NOTE: -MemoryLimit '$MemoryLimit' is a bare number; assuming $normalizedMem"
+    }
+    $env:QA4SM_DASK_MEMORY_LIMIT = $normalizedMem
+    Write-Log "ENV QA4SM_DASK_MEMORY_LIMIT=$normalizedMem"
 } else {
     Remove-Item Env:QA4SM_DASK_MEMORY_LIMIT -ErrorAction SilentlyContinue
 }

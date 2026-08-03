@@ -187,6 +187,37 @@ def _configure_logging(log_level: str, log_file: str | None = None) -> _Validati
     # Suppress verbose pytesmo internal logging (e.g. full GPI metadata dumps).
     logging.getLogger("pytesmo").setLevel(logging.CRITICAL)
 
+    # Keep Dask/distributed at WARNING so their INFO chatter doesn't drown out
+    # the validator's own progress/error lines in log files. This only affects
+    # the client process; scheduler/worker subprocesses need the dask config
+    # below, which Dask serializes into every new process it spawns.
+    for noisy in ("dask", "distributed"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+        for name in (noisy, f"distributed.{noisy}", f"{noisy}.distributed"):
+            logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("distributed.client").setLevel(logging.WARNING)
+    logging.getLogger("distributed.worker").setLevel(logging.WARNING)
+
+    try:
+        import dask.config
+
+        dask.config.set(
+            {
+                "logging": {
+                    "distributed": "warning",
+                    "distributed.core": "warning",
+                    "distributed.scheduler": "warning",
+                    "distributed.nanny": "warning",
+                    "distributed.nanny.memory": "warning",
+                    "distributed.worker": "warning",
+                    "distributed.client": "warning",
+                    "distributed.utils": "warning",
+                }
+            }
+        )
+    except ImportError:
+        pass
+
     # Keep warnings enabled, but limit duplicates via logging filter above.
     warnings.simplefilter("default")
 

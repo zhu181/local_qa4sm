@@ -710,6 +710,94 @@ def _dask_memory_limit():
     return int(0.6 * total)
 
 
+_RUNTIME_FIELDS = {
+    "id",
+    "name_tag",
+    "total_points",
+    "error_points",
+    "ok_points",
+    "output_file",
+    "progress",
+}
+
+
+def _config_hash(validation_run) -> str:
+    """Stable hash of the validation config for resume-cache keying.
+
+    Excludes run-specific/runtime fields (id, point counters, output file) so
+    that re-running the *same* config reuses the same Dask batch cache while any
+    config change (datasets, interval, bbox, metrics) starts a fresh one.
+    """
+    import hashlib
+
+    data = {k: v for k, v in vars(validation_run).items() if k not in _RUNTIME_FIELDS}
+    return hashlib.sha1(repr(data).encode("utf-8")).hexdigest()[:16]
+
+
+def _dask_batch_cache_path(validation_run) -> str:
+    """Per-config Dask batch zarr cache dir (resume source for the GPU path)."""
+    cache_root = os.path.join(OUTPUT_FOLDER, ".dask_batch_cache")
+    path = os.path.join(cache_root, _config_hash(validation_run))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _format_eta(elapsed_seconds: float, done: int, total: int) -> str:
+    if done <= 0 or total <= 0:
+        return "n/a"
+    rate = done / max(elapsed_seconds, 1e-6)
+    remaining = (total - done) / rate
+    return _format_duration(remaining)
+
+
+def _format_progress(done: int, total: int, elapsed_seconds: float, unit: str = "gpis") -> str:
+    pct = 100.0 * done / total if total else 0.0
+    return (
+        f"{done:,}/{total:,} {unit} ({pct:.1f}%) "
+        f"elapsed={_format_duration(elapsed_seconds)} ETA≈{_format_eta(elapsed_seconds, done, total)}"
+    )
+
+
+def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
+    """Build a throttled progress callback for the Dask-parallel GPU path."""
+    milestones = {0.25, 0.50, 0.75, 1.0}
+    logged_pct = set()
+    last_log = {"t": -float("inf")}
+    started = time.monotonic()
+
+    def _cb(done: int, total: int) -> None:
+        now = time.monotonic()
+        elapsed = now - started
+        pct = 100.0 * done / total if total else 0.0
+        throttled = (now - last_log["t"]) >= log_interval
+        milestone = False
+        for m in milestones:
+            if pct >= m * 100 and m not in logged_pct:
+                logged_pct.add(m)
+                milestone = True
+                break
+        if throttled or milestone or done >= total:
+            last_log["t"] = now
+            __logger.info(
+                "GPU/Dask progress: %s (validation %s)",
+                _format_progress(done, total, elapsed),
+                validation_run.id,
+            )
+
+    return _cb
+
+
 def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
     """
     Run the whole validation through a single pytesmo ``Validation.calc`` call
@@ -739,7 +827,26 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
         n_workers,
     )
 
-    results = val.calc(
+    # Streaming accumulator: each completed batch is converted and appended to
+    # the run netCDF immediately, so neither the client nor the Dask worker ever
+    # holds the full result set in memory.
+    state = {"ok": 0, "error": 0, "key": None, "seen": False}
+
+    def _batch_cb(compact_results, n_gpis):
+        state["seen"] = True
+        if not compact_results:
+            state["error"] += n_gpis
+            return
+        converted = _pytesmo_to_qa4sm_results(compact_results)
+        check_and_store_results(str(validation_run.id), converted, run_dir)
+        ok_pts, error_pts = _count_job_status(converted, n_gpis)
+        state["ok"] += ok_pts
+        state["error"] += error_pts
+        if state["key"] is None and converted:
+            state["key"] = next(iter(converted))
+
+    progress_cb = _make_gpu_progress_callback(validation_run)
+    summary = val.calc(
         all_gpis,
         all_lons,
         all_lats,
@@ -750,24 +857,31 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
         use_gpu=True,
         parallel="dask",
         n_workers=n_workers,
-        batch_size=1000,
+        batch_size=100,
         output_format="zarr",
+        output_path=_dask_batch_cache_path(validation_run),
         progress=True,
-        parallel_kwargs={"dashboard": False, "memory_limit": _dask_memory_limit()},
+        progress_callback=progress_cb,
+        batch_callback=_batch_cb,
+        parallel_kwargs={
+            "dashboard": False,
+            "memory_limit": _dask_memory_limit(),
+            "memory_target_fraction": 0.6,
+            "memory_spill_fraction": 0.55,
+        },
     )
-    if not results:
+    if not summary or summary.get("n_gpis", 0) == 0:
         __logger.warning(f"GPU/Dask validation {validation_run.id} produced no results.")
         raise RuntimeError("GPU/Dask path produced no results; falling back to the classic path.")
 
-    results = _pytesmo_to_qa4sm_results(results)
-    ok_pts, error_pts = _count_job_status(results, len(all_gpis))
-    validation_run.ok_points += ok_pts
-    validation_run.error_points += error_pts
+    validation_run.ok_points += state["ok"]
+    validation_run.error_points += state["error"]
     validation_run.progress = round(
         (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
     )
-    check_and_store_results(str(validation_run.id), results, run_dir)
-    _post_process_run(validation_run, run_dir, results)
+    # _post_process_run only needs the result keys; hand it a dict whose keys are
+    # the qa4sm combination key (mirrors what the classic path passes).
+    _post_process_run(validation_run, run_dir, {state["key"]: None})
 
 
 def _run_classic_validation(validation_run, jobs, run_dir, max_workers):
@@ -798,15 +912,18 @@ def _run_classic_validation(validation_run, jobs, run_dir, max_workers):
             now = time.monotonic()
             if now - last_heartbeat_at >= heartbeat_interval:
                 completed_jobs = total_jobs - len(pending)
-                elapsed_seconds = int(now - run_started_at)
+                elapsed_seconds = now - run_started_at
                 __logger.info(
-                    "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s pending=%s",
+                    "Heartbeat validation %s: %s jobs ok=%s error=%s",
                     validation_run.id,
-                    elapsed_seconds,
-                    validation_run.progress,
-                    completed_jobs,
-                    total_jobs,
-                    len(pending),
+                    _format_progress(
+                        completed_jobs,
+                        total_jobs,
+                        elapsed_seconds,
+                        unit="jobs",
+                    ),
+                    validation_run.ok_points,
+                    validation_run.error_points,
                 )
                 last_heartbeat_at = now
 

@@ -15,15 +15,21 @@ def _reset_use_gpu():
 
 
 class _RecordingVal:
-    """Fake pytesmo Validation whose calc() records its call args."""
+    """Fake pytesmo Validation whose calc() records its call args and invokes
+    the batch_callback once (mirroring the streaming dask path)."""
 
     def __init__(self):
         self.calls = {}
+        self.summary = {"n_gpis": 3, "batches": 1, "keys": [("a", "sm")]}
 
     def calc(self, *args, **kwargs):
         self.calls["gpis"] = np.asarray(args[0]).tolist()
         self.calls["meta"] = list(args[3]) if len(args) > 3 else []
         self.calls["kwargs"] = kwargs
+        cb = kwargs.get("batch_callback")
+        if cb is not None:
+            cb({("a", "sm"): {"status": np.array([0, 0])}}, 2)
+            return dict(self.summary)
         return {"(('a', 'sm'), ('b', 'sm'))": {"status": np.array([0, 0])}}
 
 
@@ -51,13 +57,20 @@ def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkey
     kwargs = fake.calls["kwargs"]
     assert kwargs["use_gpu"] is True
     assert kwargs["parallel"] == "dask"
+    assert kwargs["batch_size"] == 100
+    assert kwargs["output_path"]
+    assert callable(kwargs["batch_callback"])
+    assert kwargs["only_with_reference"] is True
     assert kwargs["parallel_kwargs"]["dashboard"] is False
     assert "memory_limit" in kwargs["parallel_kwargs"]
-    assert kwargs["only_with_reference"] is True
+    assert kwargs["parallel_kwargs"]["memory_target_fraction"] == 0.6
+    assert kwargs["parallel_kwargs"]["memory_spill_fraction"] == 0.55
     assert val_run.ok_points == 2
     assert val_run.error_points == 1
+    assert val_run.progress == 100
     assert stored["a"][0] == "run1"
     assert posted["a"][0] is val_run
+    assert posted["a"][2] == {("a", "sm"): None}
 
 
 def test_run_gpu_dask_validation_raises_on_empty_results(monkeypatch):
@@ -72,6 +85,22 @@ def test_run_gpu_dask_validation_raises_on_empty_results(monkeypatch):
         validation._run_gpu_dask_validation(val_run, EmptyVal(), _jobs(), "/tmp/run")
     not_called.assert_not_called()
     assert val_run.ok_points == 0
+
+
+def test_config_hash_stable_and_config_sensitive():
+    base = types.SimpleNamespace(
+        id="r1", name_tag="x", datasets=["a", "b"], interval=["2017", "2021"],
+        total_points=10, ok_points=0, error_points=0, progress=0, output_file="o.nc",
+    )
+    h1 = validation._config_hash(base)
+    # runtime-only changes (id/counters/output) do not change the hash
+    base.id = "r2"
+    base.ok_points = 5
+    base.progress = 50
+    assert validation._config_hash(base) == h1
+    # config changes (datasets) do
+    base.datasets = ["a", "c"]
+    assert validation._config_hash(base) != h1
 
 
 def test_execute_job_passes_use_gpu_from_settings(monkeypatch):
@@ -151,3 +180,50 @@ def test_dask_memory_limit_defaults_to_fraction_of_ram(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
     limit = validation._dask_memory_limit()
     assert limit == int(0.6 * 40 * 1024**3)
+
+
+def test_format_duration():
+    assert validation._format_duration(0) == "0s"
+    assert validation._format_duration(59) == "59s"
+    assert validation._format_duration(61) == "1m01s"
+    assert validation._format_duration(3600 + 120 + 5) == "1h02m05s"
+
+
+def test_format_eta_n_a_when_nothing_done():
+    assert validation._format_eta(30.0, 0, 100) == "n/a"
+
+
+def test_format_eta_scales_with_rate():
+    assert validation._format_eta(10.0, 5, 10) == "10s"
+
+
+def test_format_progress_includes_pct_and_eta():
+    text = validation._format_progress(25, 100, 50.0)
+    assert "25/100 gpis" in text
+    assert "25.0%" in text
+    assert "elapsed=50s" in text
+    assert "ETA≈2m30s" in text
+
+
+def test_gpu_progress_callback_throttles_and_reports_milestones(monkeypatch, caplog):
+    tick = {"t": 0.0}
+    monkeypatch.setattr(validation.time, "monotonic", lambda: tick["t"])
+    run = types.SimpleNamespace(id="run-p")
+    cb = validation._make_gpu_progress_callback(run, log_interval=15.0)
+
+    with caplog.at_level("INFO", logger="validator.validation"):
+        tick["t"] = 0.0
+        cb(1, 100)  # first call -> throttled (now - 0 >= 15)
+        tick["t"] = 5.0
+        cb(6, 100)  # within interval, no milestone -> suppressed
+        tick["t"] = 20.0
+        cb(25, 100)  # throttled again
+        tick["t"] = 30.0
+        cb(50, 100)  # 50% milestone
+
+    messages = [r.message for r in caplog.records if r.message.startswith("GPU/Dask progress")]
+    assert len(messages) == 3
+    assert "1/100" in messages[0]
+    assert "25/100" in messages[1]
+    assert "50/100" in messages[2]
+
