@@ -46,14 +46,15 @@ function Show-Usage {
     Write-Host "                     Limit the run to a bounding box (min_lat,min_lon,max_lat,max_lon)"
     Write-Host "  -Gpu               Use the Dask-parallel GPU path (sets QA4SM_USE_GPU=1)"
     Write-Host "  -MemoryLimit <size>"
-    Write-Host "                     Dask worker memory limit, e.g. '16GB' or '8GiB' (QA4SM_DASK_MEMORY_LIMIT; default 60% of RAM)"
+    Write-Host "                     Total memory budget for all Dask workers, e.g. '16GB' or '8GiB'"
+    Write-Host "                     (QA4SM_DASK_MEMORY_LIMIT; divided equally per worker; default 4GB per worker)"
     Write-Host "  -Heartbeat <sec>   Heartbeat interval in seconds (QA4SM_HEARTBEAT_INTERVAL_SECONDS; default 60)"
     Write-Host "  -EnvVar <NAME=value>"
     Write-Host "                     Set any extra env var for the run (repeatable)"
     Write-Host "  -DryRun            Parse and print the config without running it"
     Write-Host "  -LogLevel <level>  DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO)"
     Write-Host "  -LogFile <path>    Write logs to a file (default: auto-created in logs\)"
-    Write-Host "  -MaxWorkers <n>    Number of parallel workers"
+    Write-Host "  -MaxWorkers <n>    Number of Dask workers (default min(2, CPU count))"
     Write-Host "  -List              Show this help"
     Write-Host "  -Interactive       Prompt for preset, bbox, GPU, etc. (GPU defaults to ON)"
     Write-Host ""
@@ -102,12 +103,12 @@ Write-Log ("  Preset     : {0}" -f $(if ($Preset) { $Preset } else { "(default)"
 Write-Log ("  Config     : {0}" -f $(if ($Config) { $Config } else { "(none)" }))
 Write-Log ("  BBox       : {0}" -f $(if ($BBox) { "$BBox" } else { "(none)" }))
 Write-Log ("  Gpu        : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
-Write-Log ("  MemoryLimit: {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "(default 60% RAM)" }))
+Write-Log ("  MemoryLimit: {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "(default 4GB per worker)" }))
 Write-Log ("  Heartbeat  : {0}" -f $(if ($Heartbeat -gt 0) { $Heartbeat } else { "(default 60)" }))
 Write-Log ("  EnvVar     : {0}" -f $(if ($EnvVar.Count) { ($EnvVar -join "; ") } else { "(none)" }))
 Write-Log ("  LogLevel   : {0}" -f $LogLevel)
 Write-Log ("  LogFile    : {0}" -f $LogFile)
-Write-Log ("  MaxWorkers : {0}" -f $(if ($MaxWorkers -gt 0) { $MaxWorkers } else { "(default)" }))
+Write-Log ("  MaxWorkers : {0}" -f $(if ($MaxWorkers -gt 0) { $MaxWorkers } else { "(default 2)" }))
 Write-Log ("  DryRun     : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
 Write-Log ("  Interactive: {0}" -f $(if ($Interactive) { "yes" } else { "no" }))
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -167,8 +168,11 @@ if ($Interactive) {
         $Gpu = Confirm-YesNo -Prompt "Use GPU/Dask path?" -Default $true
 
         $MemoryLimit = ""
-        $mem = Read-Input -Prompt "Dask memory limit (Enter for default 60% RAM, e.g. 16GB) "
+        $mem = Read-Input -Prompt "Total memory budget for Dask workers (Enter for default 4GB/worker, e.g. 16GB) "
         if ($mem -ne "") { $MemoryLimit = $mem }
+
+        $workersInput = Read-Input -Prompt "Number of Dask workers (Enter for default 2, e.g. 4) "
+        if ($workersInput -match '^\d+$' -and [int]$workersInput -ge 1) { $MaxWorkers = [int]$workersInput }
 
         $DryRun = Confirm-YesNo -Prompt "Dry-run (parse only)?" -Default $false
 
@@ -177,7 +181,8 @@ if ($Interactive) {
         Write-Log ("  Preset : {0}" -f $Preset)
         Write-Log ("  BBox   : {0}" -f $(if ($BBox) { $BBox } else { "(none - full)" }))
         Write-Log ("  GPU    : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
-        Write-Log ("  Memory : {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "default (60% RAM)" }))
+        Write-Log ("  Memory : {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "default (4GB/worker)" }))
+        Write-Log ("  Workers: {0}" -f $(if ($MaxWorkers -gt 0) { $MaxWorkers } else { "default (2)" }))
         Write-Log ("  DryRun : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
         Write-Host "-----------------"
         $choice = Read-Input -Prompt "Run / Change / Quit (r/c/q) "

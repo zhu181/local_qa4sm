@@ -722,24 +722,24 @@ def _gpu_dask_requested() -> bool:
     return True
 
 
-def _dask_memory_limit():
+def _dask_memory_limit(n_workers=1):
     """Per-worker memory limit for the Dask GPU path.
 
-    Uses ``QA4SM_DASK_MEMORY_LIMIT`` (Dask-compatible string like "16GB") when
-    set, otherwise falls back to 60% of total system memory. Dask's default
-    "auto" (~40%) is too tight for memory-hungry readers and triggers
-    ``KilledWorker``.
+    When ``QA4SM_DASK_MEMORY_LIMIT`` is set, it is treated as the **total**
+    budget for all workers and divided equally.  When unset, each worker
+    defaults to 4 GB.  Dask's default "auto" (~40 %) is too tight for
+    memory-hungry readers and triggers ``KilledWorker``.
     """
     limit = getattr(settings, "DASK_MEMORY_LIMIT", None)
     if limit is not None:
-        return limit
-    try:
-        import psutil
+        if isinstance(limit, str):
+            from dask.utils import parse_bytes
 
-        total = psutil.virtual_memory().total
-    except Exception:
-        total = 32 * 1024**3
-    return int(0.6 * total)
+            total_bytes = parse_bytes(limit)
+        else:
+            total_bytes = int(limit)
+        return max(1, total_bytes // max(1, n_workers))
+    return 4 * 1024**3
 
 
 _RUNTIME_FIELDS = {
@@ -764,11 +764,7 @@ def _config_hash(validation_run) -> str:
     """
     import hashlib
 
-    data = {
-        k: v
-        for k, v in vars(validation_run).items()
-        if k not in _RUNTIME_FIELDS and not callable(v)
-    }
+    data = {k: v for k, v in vars(validation_run).items() if k not in _RUNTIME_FIELDS and not callable(v)}
     return hashlib.sha1(repr(data).encode("utf-8")).hexdigest()[:16]
 
 
@@ -873,6 +869,9 @@ def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
             except Exception:
                 # Non-fatal: memory monitoring is diagnostic, not essential.
                 pass
+            import gc
+
+            gc.collect()
 
     return _cb
 
@@ -956,9 +955,10 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
             batch_callback=_batch_cb,
             parallel_kwargs={
                 "dashboard": False,
-                "memory_limit": _dask_memory_limit(),
+                "memory_limit": _dask_memory_limit(n_workers),
                 "memory_target_fraction": 0.6,
-                "memory_spill_fraction": 0.55,
+                "memory_spill_fraction": 0.5,
+                "memory_terminate_fraction": 0.92,
             },
         )
     except Exception as e:

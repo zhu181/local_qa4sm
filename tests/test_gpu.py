@@ -64,7 +64,8 @@ def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkey
     assert kwargs["parallel_kwargs"]["dashboard"] is False
     assert "memory_limit" in kwargs["parallel_kwargs"]
     assert kwargs["parallel_kwargs"]["memory_target_fraction"] == 0.6
-    assert kwargs["parallel_kwargs"]["memory_spill_fraction"] == 0.55
+    assert kwargs["parallel_kwargs"]["memory_spill_fraction"] == 0.5
+    assert kwargs["parallel_kwargs"]["memory_terminate_fraction"] == 0.92
     assert val_run.ok_points == 2
     assert val_run.error_points == 1
     assert val_run.progress == 100
@@ -89,8 +90,15 @@ def test_run_gpu_dask_validation_raises_on_empty_results(monkeypatch):
 
 def test_config_hash_stable_and_config_sensitive():
     base = types.SimpleNamespace(
-        id="r1", name_tag="x", datasets=["a", "b"], interval=["2017", "2021"],
-        total_points=10, ok_points=0, error_points=0, progress=0, output_file="o.nc",
+        id="r1",
+        name_tag="x",
+        datasets=["a", "b"],
+        interval=["2017", "2021"],
+        total_points=10,
+        ok_points=0,
+        error_points=0,
+        progress=0,
+        output_file="o.nc",
     )
     h1 = validation._config_hash(base)
     # runtime-only changes (id/counters/output) do not change the hash
@@ -115,14 +123,25 @@ def test_config_hash_stable_with_backref_models():
     def make(ds_short_name):
         run = ValidationRun(id="some-run-uuid", name_tag="x")
         ds = Dataset(
-            id=1, short_name=ds_short_name, pretty_name="D", help_text="",
-            detailed_description="", source_reference="", citation="",
+            id=1,
+            short_name=ds_short_name,
+            pretty_name="D",
+            help_text="",
+            detailed_description="",
+            source_reference="",
+            citation="",
         )
         ver = DatasetVersion(id=1, short_name="v1", pretty_name="V1", help_text="")
         var = DataVariable(id=1, short_name="sm", pretty_name="SM", help_text="", unit="m3/m3")
         dc = DatasetConfiguration(
-            id=1, validation=run, dataset=ds, version=ver, variable=var,
-            filters=[], parametrised_filters=[], is_spatial_reference=True,
+            id=1,
+            validation=run,
+            dataset=ds,
+            version=ver,
+            variable=var,
+            filters=[],
+            parametrised_filters=[],
+            is_spatial_reference=True,
         )
         run.dataset_configurations = [dc]
         return run
@@ -176,8 +195,10 @@ def test_gpu_dask_requested_enabled_when_gpu_available(monkeypatch):
 
 
 def test_dask_memory_limit_uses_env_override(monkeypatch):
+    from dask.utils import parse_bytes
+
     monkeypatch.setattr(settings, "DASK_MEMORY_LIMIT", "16GB")
-    assert validation._dask_memory_limit() == "16GB"
+    assert validation._dask_memory_limit() == parse_bytes("16GB")
 
 
 def test_setup_metric_calculators_tcol_uses_prefixed_spatial_ref_name(monkeypatch):
@@ -197,20 +218,22 @@ def test_setup_metric_calculators_tcol_uses_prefixed_spatial_ref_name(monkeypatc
         intra_annual_metrics=False,
         stability_metrics=False,
     )
-    validation._setup_metric_calculators(
-        3, ["0-ISMN", "1-SPL3SMPE", "2-NSMCSMC"], val_run, {}, None, None, "0-ISMN"
-    )
+    validation._setup_metric_calculators(3, ["0-ISMN", "1-SPL3SMPE", "2-NSMCSMC"], val_run, {}, None, None, "0-ISMN")
     assert captured["refname"] == "0-ISMN"
 
 
-def test_dask_memory_limit_defaults_to_fraction_of_ram(monkeypatch):
+def test_dask_memory_limit_defaults_to_4gb(monkeypatch):
     monkeypatch.setattr(settings, "DASK_MEMORY_LIMIT", None)
-    import sys
-
-    fake_psutil = types.SimpleNamespace(virtual_memory=lambda: types.SimpleNamespace(total=40 * 1024**3))
-    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
     limit = validation._dask_memory_limit()
-    assert limit == int(0.6 * 40 * 1024**3)
+    assert limit == 4 * 1024**3
+
+
+def test_dask_memory_limit_divides_total_budget(monkeypatch):
+    from dask.utils import parse_bytes
+
+    monkeypatch.setattr(settings, "DASK_MEMORY_LIMIT", "16GB")
+    limit = validation._dask_memory_limit(n_workers=2)
+    assert limit == parse_bytes("16GB") // 2
 
 
 def test_format_duration():
@@ -257,4 +280,3 @@ def test_gpu_progress_callback_throttles_and_reports_milestones(monkeypatch, cap
     assert "1/100" in messages[0]
     assert "25/100" in messages[1]
     assert "50/100" in messages[2]
-

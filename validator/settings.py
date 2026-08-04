@@ -1,7 +1,7 @@
 import os
 
 MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs"))
-DEFAULT_PARALLEL_WORKERS = os.cpu_count() or 1
+DEFAULT_PARALLEL_WORKERS = min(2, os.cpu_count() or 1)
 
 # Configure max number of local workers used in run_validation.
 # Can be overridden via environment variable QA4SM_MAX_PARALLEL_WORKERS.
@@ -18,8 +18,7 @@ if HEARTBEAT_INTERVAL_SECONDS < 1:
 # Falls back to the classic threaded path if no GPU/CuPy is available.
 USE_GPU = os.getenv("QA4SM_USE_GPU", "0") == "1"
 
-# Memory limit for each Dask worker in the GPU/Dask path. Accepts a string
-# parsable by Dask (e.g. "16GB") or a plain byte count. If unset it defaults
-# to 60% of the total system memory, which is more generous than Dask's
-# conservative "auto" (~40%) and avoids KilledWorker on heavy readers.
+# Total memory budget for all Dask workers in the GPU/Dask path. Accepts a
+# string parsable by Dask (e.g. "16GB") or a plain byte count. The value is
+# divided equally among workers. If unset, each worker defaults to 4 GB.
 DASK_MEMORY_LIMIT = os.getenv("QA4SM_DASK_MEMORY_LIMIT", "") or None
