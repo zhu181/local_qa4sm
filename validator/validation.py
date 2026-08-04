@@ -808,11 +808,20 @@ def _format_progress(done: int, total: int, elapsed_seconds: float, unit: str = 
 
 
 def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
-    """Build a throttled progress callback for the Dask-parallel GPU path."""
+    """Build a throttled progress callback for the Dask-parallel GPU path.
+
+    In addition to progress logging, this callback periodically queries
+    worker memory statistics via the Dask scheduler and emits a WARNING
+    through the client's logging system when unmanaged memory is high.
+    This ensures the diagnostic reaches the log file (the worker-side
+    ``distributed.worker.memory`` warning only goes to the worker's stderr).
+    """
     milestones = {0.25, 0.50, 0.75, 1.0}
     logged_pct = set()
     last_log = {"t": -float("inf")}
+    last_mem_check = {"t": -float("inf")}
     started = time.monotonic()
+    mem_check_interval = 60.0  # seconds between worker memory queries
 
     def _cb(done: int, total: int) -> None:
         now = time.monotonic()
@@ -833,7 +842,50 @@ def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
                 validation_run.id,
             )
 
+        # Periodically check worker memory from the client side so that
+        # unmanaged-memory warnings appear in the log file.
+        if (now - last_mem_check["t"]) >= mem_check_interval:
+            last_mem_check["t"] = now
+            try:
+                from dask.distributed import get_client
+
+                client = get_client()
+                info = client.scheduler_info()
+                for addr, winfo in info.get("workers", {}).items():
+                    mem = winfo.get("metrics", {}).get("memory", {})
+                    process_mem = mem.get("process", 0)
+                    managed = mem.get("managed", 0)
+                    unmanaged = process_mem - managed if process_mem > managed else 0
+                    mem_limit = winfo.get("nbytes", 0)
+                    if mem_limit and process_mem:
+                        frac = process_mem / mem_limit
+                        if frac > 0.7:
+                            __logger.warning(
+                                "Dask worker %s memory usage high: %.0f%% "
+                                "(process=%s managed=%s unmanaged=%s limit=%s)",
+                                addr,
+                                frac * 100,
+                                _fmt_bytes(process_mem),
+                                _fmt_bytes(managed),
+                                _fmt_bytes(unmanaged),
+                                _fmt_bytes(mem_limit),
+                            )
+            except Exception:
+                # Non-fatal: memory monitoring is diagnostic, not essential.
+                pass
+
     return _cb
+
+
+def _fmt_bytes(n: int) -> str:
+    """Format byte count as human-readable string (e.g. '1.5 GiB')."""
+    if n <= 0:
+        return "0 B"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
 
 
 def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
