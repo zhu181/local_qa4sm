@@ -1472,7 +1472,7 @@ wheels = [
 
 [[package]]
 name = "pytesmo"
-version = "0.18.1.post1.dev17+g88bac5518.d20260804"
+version = "0.18.1.post1.dev20+g257aada03ed0ed3bf770932afed23ba95edc4cc8.d20260907"
 source = { editable = "pytesmo" }
 dependencies = [
     { name = "cadati" },
