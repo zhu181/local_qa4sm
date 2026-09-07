@@ -47,7 +47,9 @@ function Show-Usage {
     Write-Host "  -Gpu               Use the Dask-parallel GPU path (sets QA4SM_USE_GPU=1)"
     Write-Host "  -MemoryLimit <size>"
     Write-Host "                     Total memory budget for all Dask workers, e.g. '16GB' or '8GiB'"
-    Write-Host "                     (QA4SM_DASK_MEMORY_LIMIT; divided equally per worker; default 4GB per worker)"
+    Write-Host "                     (QA4SM_DASK_MEMORY_LIMIT; divided equally per worker; last value is"
+    Write-Host "                     persisted to outputs\.dask_memory_limit and reused on later runs;"
+    Write-Host "                     fallback default 16GB total)"
     Write-Host "  -Heartbeat <sec>   Heartbeat interval in seconds (QA4SM_HEARTBEAT_INTERVAL_SECONDS; default 60)"
     Write-Host "  -EnvVar <NAME=value>"
     Write-Host "                     Set any extra env var for the run (repeatable)"
@@ -70,6 +72,17 @@ if ($List) {
     Show-Usage
     exit 0
 }
+
+# --- memory-limit persistence -------------------------------------------------
+# The Dask memory budget is per-process (env var) and does NOT survive a restart.
+# Remember the last explicitly-set value so a later run without -MemoryLimit
+# doesn't silently fall back to the 4GB-per-worker default.
+$memFile = Join-Path $PSScriptRoot "outputs" ".dask_memory_limit"
+$persistedMem = ""
+if (Test-Path -LiteralPath $memFile) {
+    $persistedMem = (Get-Content -LiteralPath $memFile -Raw).Trim()
+}
+$defaultMemLimit = if ($persistedMem -ne "") { $persistedMem } else { "16GB" }
 
 # --- logging setup -----------------------------------------------------------
 $script:activeLogFile = ""
@@ -103,7 +116,7 @@ Write-Log ("  Preset     : {0}" -f $(if ($Preset) { $Preset } else { "(default)"
 Write-Log ("  Config     : {0}" -f $(if ($Config) { $Config } else { "(none)" }))
 Write-Log ("  BBox       : {0}" -f $(if ($BBox) { "$BBox" } else { "(none)" }))
 Write-Log ("  Gpu        : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
-Write-Log ("  MemoryLimit: {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "(default 4GB per worker)" }))
+Write-Log ("  MemoryLimit: {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "(default $defaultMemLimit total)" }))
 Write-Log ("  Heartbeat  : {0}" -f $(if ($Heartbeat -gt 0) { $Heartbeat } else { "(default 60)" }))
 Write-Log ("  EnvVar     : {0}" -f $(if ($EnvVar.Count) { ($EnvVar -join "; ") } else { "(none)" }))
 Write-Log ("  LogLevel   : {0}" -f $LogLevel)
@@ -168,7 +181,7 @@ if ($Interactive) {
         $Gpu = Confirm-YesNo -Prompt "Use GPU/Dask path?" -Default $true
 
         $MemoryLimit = ""
-        $mem = Read-Input -Prompt "Total memory budget for Dask workers (Enter for default 4GB/worker, e.g. 16GB) "
+        $mem = Read-Input -Prompt "Total memory budget for Dask workers (Enter for default $defaultMemLimit total) "
         if ($mem -ne "") { $MemoryLimit = $mem }
 
         $workersInput = Read-Input -Prompt "Number of Dask workers (Enter for default 2, e.g. 4) "
@@ -181,7 +194,7 @@ if ($Interactive) {
         Write-Log ("  Preset : {0}" -f $Preset)
         Write-Log ("  BBox   : {0}" -f $(if ($BBox) { $BBox } else { "(none - full)" }))
         Write-Log ("  GPU    : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
-        Write-Log ("  Memory : {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "default (4GB/worker)" }))
+        Write-Log ("  Memory : {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "default ($defaultMemLimit total)" }))
         Write-Log ("  Workers: {0}" -f $(if ($MaxWorkers -gt 0) { $MaxWorkers } else { "default (2)" }))
         Write-Log ("  DryRun : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
         Write-Host "-----------------"
@@ -314,8 +327,13 @@ if ($MemoryLimit -ne "") {
     }
     $env:QA4SM_DASK_MEMORY_LIMIT = $normalizedMem
     Write-Log "ENV QA4SM_DASK_MEMORY_LIMIT=$normalizedMem"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $memFile) -Force | Out-Null
+    Set-Content -LiteralPath $memFile -Value $normalizedMem -Encoding utf8
+    Write-Log "Persisted memory limit to $memFile"
 } else {
-    Remove-Item Env:QA4SM_DASK_MEMORY_LIMIT -ErrorAction SilentlyContinue
+    $src = if ($persistedMem -ne "") { "from persisted $memFile" } else { "default (no persisted value)" }
+    $env:QA4SM_DASK_MEMORY_LIMIT = $defaultMemLimit
+    Write-Log "ENV QA4SM_DASK_MEMORY_LIMIT=$defaultMemLimit ($src)"
 }
 if ($Heartbeat -gt 0) {
     $env:QA4SM_HEARTBEAT_INTERVAL_SECONDS = "$Heartbeat"
