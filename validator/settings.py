@@ -22,3 +22,17 @@ USE_GPU = os.getenv("QA4SM_USE_GPU", "0") == "1"
 # string parsable by Dask (e.g. "16GB") or a plain byte count. The value is
 # divided equally among workers. If unset, each worker defaults to 4 GB.
 DASK_MEMORY_LIMIT = os.getenv("QA4SM_DASK_MEMORY_LIMIT", "") or None
+
+
+# Number of gpis computed per Dask batch in the GPU/Dask path. Larger batches
+# amortize the per-batch fixed costs (reader deserialization, GC, zarr save)
+# better; per-gpi peak memory is small because the Dask path reads targeted
+# slices (read_bulk=False) instead of bulk-loading whole datasets per batch.
+def _parse_batch_size() -> int:
+    try:
+        return max(1, int(os.getenv("QA4SM_DASK_BATCH_SIZE", "100")))
+    except (TypeError, ValueError):
+        return 100
+
+
+DASK_BATCH_SIZE = _parse_batch_size()

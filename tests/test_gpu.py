@@ -1,3 +1,4 @@
+import inspect
 import types
 from unittest import mock
 
@@ -57,7 +58,7 @@ def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkey
     kwargs = fake.calls["kwargs"]
     assert kwargs["use_gpu"] is True
     assert kwargs["parallel"] == "dask"
-    assert kwargs["batch_size"] == 100
+    assert kwargs["batch_size"] == settings.DASK_BATCH_SIZE
     assert kwargs["output_path"]
     assert callable(kwargs["batch_callback"])
     assert kwargs["only_with_reference"] is True
@@ -109,6 +110,21 @@ def test_config_hash_stable_and_config_sensitive():
     # config changes (datasets) do
     base.datasets = ["a", "c"]
     assert validation._config_hash(base) != h1
+
+
+def test_dask_batch_cache_path_namespaced_by_batch_size(monkeypatch):
+    """Resume cache must not be shared across DASK_BATCH_SIZE values.
+
+    Batch boundaries depend on the batch size, so a cache written with one
+    batch size would misalign gpis across batches if reused after a change.
+    """
+    val_run = types.SimpleNamespace(id="r1", datasets=["a"], interval=["2017", "2021"])
+    _orig_batch_size = settings.DASK_BATCH_SIZE
+    base = validation._dask_batch_cache_path(val_run)
+    monkeypatch.setattr(settings, "DASK_BATCH_SIZE", settings.DASK_BATCH_SIZE * 2 + 1)
+    assert validation._dask_batch_cache_path(val_run) != base
+    monkeypatch.setattr(settings, "DASK_BATCH_SIZE", _orig_batch_size)
+    assert validation._dask_batch_cache_path(val_run) == base
 
 
 def test_config_hash_stable_with_backref_models():
@@ -228,6 +244,25 @@ def test_dask_memory_limit_defaults_to_4gb(monkeypatch):
     assert limit == 4 * 1024**3
 
 
+def test_dask_batch_size_uses_env_override(monkeypatch):
+    monkeypatch.setenv("QA4SM_DASK_BATCH_SIZE", "50")
+    assert settings._parse_batch_size() == 50
+
+
+def test_dask_batch_size_defaults_to_100(monkeypatch):
+    monkeypatch.delenv("QA4SM_DASK_BATCH_SIZE", raising=False)
+    assert settings._parse_batch_size() == 100
+
+
+def test_dask_batch_size_floors_at_1(monkeypatch):
+    monkeypatch.setenv("QA4SM_DASK_BATCH_SIZE", "0")
+    assert settings._parse_batch_size() == 1
+    monkeypatch.setenv("QA4SM_DASK_BATCH_SIZE", "-5")
+    assert settings._parse_batch_size() == 1
+    monkeypatch.setenv("QA4SM_DASK_BATCH_SIZE", "abc")
+    assert settings._parse_batch_size() == 100
+
+
 def test_dask_memory_limit_divides_total_budget(monkeypatch):
     from dask.utils import parse_bytes
 
@@ -257,6 +292,100 @@ def test_format_progress_includes_pct_and_eta():
     assert "25.0%" in text
     assert "elapsed=50s" in text
     assert "ETA≈2m30s" in text
+
+
+def test_create_pytesmo_validation_read_bulk_controlled_by_arg(monkeypatch):
+    """Dask path must build gridded readers with read_bulk=False; classic path
+    keeps the default read_bulk=True (reader instances are reused within a job)."""
+    from validator.orchestrator import parse_validation_run_config
+
+    run = parse_validation_run_config(
+        {
+            "validation_run": {
+                "id": 9001,
+                "name_tag": "read-bulk-test",
+                "scaling_method": "none",
+                "upscaling_method": "none",
+                "interval_from": "2020-01-01",
+                "interval_to": "2020-12-31",
+                "anomalies": "none",
+                "temporal_matching": 12,
+                "dataset_configurations": [
+                    {
+                        "id": 101,
+                        "is_spatial_reference": True,
+                        "is_temporal_reference": True,
+                        "dataset": {
+                            "id": 1,
+                            "short_name": "REF",
+                            "pretty_name": "Ref",
+                            "help_text": "",
+                            "detailed_description": "",
+                            "source_reference": "",
+                            "citation": "",
+                            "storage_path": "/path/to/data",
+                            "reader": "SMAPL3_V9Reader",
+                        },
+                        "version": {"id": 11, "short_name": "v1", "pretty_name": "V1", "help_text": ""},
+                        "variable": {
+                            "id": 21,
+                            "short_name": "sm",
+                            "pretty_name": "SM",
+                            "help_text": "",
+                            "unit": "m3/m3",
+                        },
+                        "filters": [],
+                        "parametrised_filters": [],
+                    }
+                ],
+                "spatial_reference_configuration": 101,
+                "temporal_reference_configuration": 101,
+            }
+        }
+    )
+
+    read_bulk_seen = []
+    fake_reader = object()
+    monkeypatch.setattr(
+        validation,
+        "create_reader",
+        lambda ds, v, read_bulk=True: (read_bulk_seen.append(read_bulk), fake_reader)[1],
+    )
+    monkeypatch.setattr(validation, "adapt_timestamp", lambda r, d, v: r)
+    monkeypatch.setattr(
+        validation,
+        "setup_filtering",
+        lambda reader, filters, param_filters, dataset, variable: (reader, "read", {}),
+    )
+    monkeypatch.setattr(validation, "_apply_anomaly_adapter", lambda r, vr, dc, name: r)
+    dm = mock.Mock()
+    dm.reference_name = "0-REF"
+    dm.datasets = {"0-REF": {}}
+    monkeypatch.setattr(validation, "DataManager", lambda datasets, **kw: dm)
+    monkeypatch.setattr(validation, "get_dataset_names", lambda *a, **k: ["0-REF"])
+    monkeypatch.setattr(
+        validation,
+        "define_tsw_metrics",
+        lambda vr, period: {"temp_sub_wdw_instance": None, "temp_sub_wdws": None},
+    )
+    monkeypatch.setattr(validation, "_setup_metric_calculators", lambda *a, **k: {})
+    monkeypatch.setattr(validation, "make_combined_temporal_matcher", lambda td: lambda *a, **k: None)
+    monkeypatch.setattr(validation, "Validation", lambda **kw: object())
+
+    validation.create_pytesmo_validation(run, read_bulk=False)
+    assert read_bulk_seen == [False]
+    validation.create_pytesmo_validation(run)
+    assert read_bulk_seen == [False, True]
+
+
+def test_reader_registry_factories_accept_read_bulk():
+    """create_reader() calls every factory as (dataset, version, read_bulk);
+    a factory that drops the arg (e.g. ISMN) raises TypeError at runtime."""
+    from validator import readers
+
+    for name, factory in readers._READER_REGISTRY.items():
+        params = list(inspect.signature(factory).parameters)
+        assert "read_bulk" in params, f"factory for '{name}' must accept read_bulk"
 
 
 def test_gpu_progress_callback_throttles_and_reports_milestones(monkeypatch, caplog):

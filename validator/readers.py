@@ -136,7 +136,7 @@ class SMOSL2Reader(GriddedNcIndexedRaggedTs):
         return ts
 
 
-def _create_ismn_reader(dataset: Dataset, version) -> ISMN_Interface:
+def _create_ismn_reader(dataset: Dataset, version, read_bulk: bool = True) -> ISMN_Interface:
     if path.isfile(path.join(dataset.storage_path, "frm_classification.csv")):
         custom_meta_readers = [
             CustomSensorMetadataCsv(
@@ -161,20 +161,38 @@ def _create_smap_ts_reader(dataset: Dataset, version) -> GriddedNcTs:
 
 _READER_REGISTRY: dict[str, callable] = {
     "ISMN_Interface": _create_ismn_reader,
-    "SMAPTs": _create_smap_ts_reader,
-    "SMAPL3_V9Reader": lambda d, v: SMAPL3_V9Reader(d.storage_path, ioclass_kws={"read_bulk": True}),
-    "GriddedNcOrthoMultiTs": lambda d, v: GriddedNcOrthoMultiTs(d.storage_path, ioclass_kws={"read_bulk": True}),
-    "GriddedNcContiguousRaggedTs": lambda d, v: GriddedNcContiguousRaggedTs(
-        d.storage_path, ioclass_kws={"read_bulk": True}
+    "SMAPTs": lambda d, v, read_bulk: SMAPTs(d.storage_path, ioclass_kws={"read_bulk": read_bulk}),
+    "SMAPL3_V9Reader": lambda d, v, read_bulk: SMAPL3_V9Reader(d.storage_path, ioclass_kws={"read_bulk": read_bulk}),
+    "GriddedNcOrthoMultiTs": lambda d, v, read_bulk: GriddedNcOrthoMultiTs(
+        d.storage_path, ioclass_kws={"read_bulk": read_bulk}
+    ),
+    "GriddedNcContiguousRaggedTs": lambda d, v, read_bulk: GriddedNcContiguousRaggedTs(
+        d.storage_path, ioclass_kws={"read_bulk": read_bulk}
     ),
 }
 
 
-def create_reader(dataset: Dataset, version) -> GriddedNcTs:
+def create_reader(dataset: Dataset, version, read_bulk: bool = True) -> GriddedNcTs:
+    """Create a data reader for the given dataset.
+
+    Parameters
+    ----------
+    dataset : Dataset
+        Dataset configuration with a ``reader`` name and ``storage_path``.
+    version :
+        Dataset version configuration.
+    read_bulk : bool, optional (default: True)
+        Whether gridded readers should cache the full dataset in memory
+        (``ioclass_kws={"read_bulk": read_bulk}``). ``True`` is only beneficial
+        when the reader instance survives across reads (classic threaded path);
+        the Dask GPU path deserializes a fresh reader per batch, so a bulk read
+        would reload the entire dataset into RAM on every batch. Pass
+        ``read_bulk=False`` there.
+    """
     name = dataset.reader
     if name not in _READER_REGISTRY:
         raise ValueError(f"Reader '{name}' for dataset '{dataset}' not available")
-    return _READER_REGISTRY[name](dataset, version)
+    return _READER_REGISTRY[name](dataset, version, read_bulk)
 
 
 def adapt_timestamp(reader, dataset, version):

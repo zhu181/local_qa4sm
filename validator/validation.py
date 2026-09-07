@@ -357,7 +357,7 @@ def _setup_upscaling(validation_run, datasets, spatial_ref_name):
     return upscale_parms
 
 
-def create_pytesmo_validation(validation_run: ValidationRun):
+def create_pytesmo_validation(validation_run: ValidationRun, read_bulk: bool = True):
     ds_list = []
     ds_read_names = []
     spatial_ref_name = None
@@ -367,7 +367,10 @@ def create_pytesmo_validation(validation_run: ValidationRun):
 
     ds_num = 1
     for dataset_config in validation_run.dataset_configurations:
-        reader = create_reader(dataset_config.dataset, dataset_config.version)
+        # The Dask GPU path deserializes readers fresh on every batch; a bulk read
+        # would load the whole dataset into RAM per batch. Read targeted slices
+        # instead (the classic path keeps read_bulk=True).
+        reader = create_reader(dataset_config.dataset, dataset_config.version, read_bulk=read_bulk)
         time_adapted_reader = adapt_timestamp(reader, dataset_config.dataset, dataset_config.version)
         reader, read_name, read_kwargs = setup_filtering(
             reader=time_adapted_reader,
@@ -769,9 +772,15 @@ def _config_hash(validation_run) -> str:
 
 
 def _dask_batch_cache_path(validation_run) -> str:
-    """Per-config Dask batch zarr cache dir (resume source for the GPU path)."""
+    """Per-config Dask batch zarr cache dir (resume source for the GPU path).
+
+    The cache is also namespaced by batch size: batch boundaries depend on
+    DASK_BATCH_SIZE, so a cache written with a different batch size would
+    misalign gpis across resumed batches. A batch-size change therefore starts
+    a fresh cache dir (the old one is left unused, not corrupted).
+    """
     cache_root = os.path.join(OUTPUT_FOLDER, ".dask_batch_cache")
-    path = os.path.join(cache_root, _config_hash(validation_run))
+    path = os.path.join(cache_root, f"{_config_hash(validation_run)}_b{settings.DASK_BATCH_SIZE}")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -947,7 +956,7 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
             use_gpu=True,
             parallel="dask",
             n_workers=n_workers,
-            batch_size=100,
+            batch_size=settings.DASK_BATCH_SIZE,
             output_format="zarr",
             output_path=_dask_batch_cache_path(validation_run),
             progress=True,
@@ -1096,7 +1105,7 @@ def run_validation(validation_run: ValidationRun):
         __logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
 
         if _gpu_dask_requested():
-            val = create_pytesmo_validation(validation_run)
+            val = create_pytesmo_validation(validation_run, read_bulk=False)
             try:
                 _run_gpu_dask_validation(validation_run, val, jobs, run_dir)
             except Exception as e:
