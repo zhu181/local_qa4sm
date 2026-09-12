@@ -4,6 +4,8 @@ param(
     [string]$Config = "",
     [object]$BBox = "",
     [switch]$Gpu,
+    [switch]$Dask,
+    [switch]$Classic,
     [string]$MemoryLimit = "",
     [int]$Heartbeat = 0,
     [string[]]$EnvVar = @(),
@@ -12,6 +14,10 @@ param(
     [string]$LogLevel = "INFO",
     [string]$LogFile = "",
     [int]$MaxWorkers = 0,
+    [int]$MaxReadRetries = 0,
+    [int]$DaskBatchRetries = 0,
+    [float]$ThreadTimeout = 0,
+    [int]$CacheLoadRetries = 0,
     [switch]$List,
     [switch]$Interactive
 )
@@ -44,27 +50,46 @@ function Show-Usage {
     Write-Host "  -Config <path>     Run an explicit config file (overrides -Preset)"
     Write-Host "  -BBox <lat0,lon0,lat1,lon1>"
     Write-Host "                     Limit the run to a bounding box (min_lat,min_lon,max_lat,max_lon)"
-    Write-Host "  -Gpu               Use the Dask-parallel GPU path (sets QA4SM_USE_GPU=1)"
+    Write-Host "  -Gpu               Enable GPU acceleration. Implies -Dask. (sets QA4SM_USE_GPU=1)"
+    Write-Host "  -Dask              Use the Dask streaming path (NumPy metrics). Default; sets QA4SM_USE_DASK=1."
+    Write-Host "  -Classic           Force the classic ThreadPoolExecutor path. Sets QA4SM_USE_CLASSIC=1"
+    Write-Host "                     (and unsets QA4SM_USE_DASK). Escape hatch for environments that need it."
     Write-Host "  -MemoryLimit <size>"
     Write-Host "                     Total memory budget for all Dask workers, e.g. '16GB' or '8GiB'"
     Write-Host "                     (QA4SM_DASK_MEMORY_LIMIT; divided equally per worker; last value is"
     Write-Host "                     persisted to outputs\.dask_memory_limit and reused on later runs;"
-    Write-Host "                     fallback default 16GB total)"
+    Write-Host "                     fallback default 16GB total). Ignored under -Classic."
     Write-Host "  -Heartbeat <sec>   Heartbeat interval in seconds (QA4SM_HEARTBEAT_INTERVAL_SECONDS; default 60)"
     Write-Host "  -EnvVar <NAME=value>"
     Write-Host "                     Set any extra env var for the run (repeatable)"
     Write-Host "  -DryRun            Parse and print the config without running it"
     Write-Host "  -LogLevel <level>  DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO)"
     Write-Host "  -LogFile <path>    Write logs to a file (default: auto-created in logs\)"
-    Write-Host "  -MaxWorkers <n>    Number of Dask workers (default min(2, CPU count))"
+    Write-Host "  -MaxWorkers <n>    Number of parallel workers (Dask cluster size or classic threads;"
+    Write-Host "                     default min(2, CPU count))"
+    Write-Host "  -MaxReadRetries <n>"
+    Write-Host "                     Additional retries when the reader raises a corrupt-input-file error"
+    Write-Host "                     (QA4SM_MAX_READ_RETRIES; default 3). After the retries are exhausted the"
+    Write-Host "                     gpi is recorded as no-data and the run continues."
+    Write-Host "  -DaskBatchRetries <n>"
+    Write-Host "                     Dask-level retries for whole batch tasks (QA4SM_DASK_BATCH_RETRIES; default 3)."
+    Write-Host "                     Independent of -MaxReadRetries (which retries individual jobs)."
+    Write-Host "  -ThreadTimeout <sec>"
+    Write-Host "                     Per-job timeout on the classic ThreadPoolExecutor path (QA4SM_THREAD_TIMEOUT_SECONDS;"
+    Write-Host "                     default 0 = disabled). When set, jobs that don't finish within the window"
+    Write-Host "                     are resubmitted; the hung thread continues in the background."
+    Write-Host "  -CacheLoadRetries <n>"
+    Write-Host "                     Consecutive zarr cache load failures before a corrupt batch is quarantined"
+    Write-Host "                     (QA4SM_CACHE_LOAD_RETRIES; default 3)."
     Write-Host "  -List              Show this help"
-    Write-Host "  -Interactive       Prompt for preset, bbox, GPU, etc. (GPU defaults to ON)"
+    Write-Host "  -Interactive       Prompt for preset, bbox, mode (Dask default), memory, workers, dry-run"
     Write-Host ""
     Write-Host "Examples:"
     Write-Host "  .\run_validation.ps1 spl3smpe -DryRun"
     Write-Host "  .\run_validation.ps1 ismn-spl3 -BBox 33,110,38,115 -Gpu"
     Write-Host "  .\run_validation.ps1 ismn-nsmc -BBox 41,-114,44,-112 -MemoryLimit 16GB"
-    Write-Host "  .\run_validation.ps1 spl3 -EnvVar QA4SM_LOG_LEVEL=DEBUG"
+    Write-Host "  .\run_validation.ps1 spl3smpe_nsmcsmc -BBox 38,-110,43,-104 -MaxWorkers 2"
+    Write-Host "  .\run_validation.ps1 spl3 -Classic   # escape hatch"
     Write-Host "  .\run_validation.ps1 -Interactive"
 }
 
@@ -115,14 +140,27 @@ Write-Log "=== run_validation.ps1 start ==="
 Write-Log ("  Preset     : {0}" -f $(if ($Preset) { $Preset } else { "(default)" }))
 Write-Log ("  Config     : {0}" -f $(if ($Config) { $Config } else { "(none)" }))
 Write-Log ("  BBox       : {0}" -f $(if ($BBox) { "$BBox" } else { "(none)" }))
-Write-Log ("  Gpu        : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
+if ($Classic) {
+    Write-Log "  Mode       : classic (ThreadPoolExecutor)"
+    Write-Log "  Gpu        : off (classic path is CPU-only)"
+} elseif ($Gpu) {
+    Write-Log "  Mode       : dask (CUDA via CuPy)"
+    Write-Log "  Gpu        : ON"
+} else {
+    Write-Log "  Mode       : dask (NumPy metrics; default)"
+    Write-Log "  Gpu        : off"
+}
 Write-Log ("  MemoryLimit: {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "(default $defaultMemLimit total)" }))
 Write-Log ("  Heartbeat  : {0}" -f $(if ($Heartbeat -gt 0) { $Heartbeat } else { "(default 60)" }))
 Write-Log ("  EnvVar     : {0}" -f $(if ($EnvVar.Count) { ($EnvVar -join "; ") } else { "(none)" }))
 Write-Log ("  LogLevel   : {0}" -f $LogLevel)
 Write-Log ("  LogFile    : {0}" -f $LogFile)
 Write-Log ("  MaxWorkers : {0}" -f $(if ($MaxWorkers -gt 0) { $MaxWorkers } else { "(default 2)" }))
-Write-Log ("  DryRun     : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
+    Write-Log ("  MaxReadRetries : {0}" -f $(if ($MaxReadRetries -gt 0) { $MaxReadRetries } else { "(default 3)" }))
+    Write-Log ("  DaskBatchRetries : {0}" -f $(if ($DaskBatchRetries -gt 0) { $DaskBatchRetries } else { "(default 3)" }))
+    Write-Log ("  ThreadTimeout : {0}" -f $(if ($ThreadTimeout -gt 0) { $ThreadTimeout } else { "(disabled)" }))
+    Write-Log ("  CacheLoadRetries : {0}" -f $(if ($CacheLoadRetries -gt 0) { $CacheLoadRetries } else { "(default 3)" }))
+    Write-Log ("  DryRun     : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
 Write-Log ("  Interactive: {0}" -f $(if ($Interactive) { "yes" } else { "no" }))
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -178,13 +216,18 @@ if ($Interactive) {
             }
         }
 
-        $Gpu = Confirm-YesNo -Prompt "Use GPU/Dask path?" -Default $true
+        $modeInput = Read-Input -Prompt "Mode? [dask|dask+gpu|classic] (Enter = dask) "
+        switch -Regex ($modeInput.Trim().ToLowerInvariant()) {
+            '^(classic|thr)' { $Classic = $true; $Gpu = $false }
+            '^(dask\+?gpu|gpu\+?dask|gpu$)' { $Classic = $false; $Gpu = $true }
+            default { $Classic = $false; $Gpu = $false }
+        }
 
         $MemoryLimit = ""
-        $mem = Read-Input -Prompt "Total memory budget for Dask workers (Enter for default $defaultMemLimit total) "
+        $mem = Read-Input -Prompt "Total memory budget for Dask workers (Enter for default $defaultMemLimit total; ignored under classic) "
         if ($mem -ne "") { $MemoryLimit = $mem }
 
-        $workersInput = Read-Input -Prompt "Number of Dask workers (Enter for default 2, e.g. 4) "
+        $workersInput = Read-Input -Prompt "Number of parallel workers (Enter for default 2, e.g. 4) "
         if ($workersInput -match '^\d+$' -and [int]$workersInput -ge 1) { $MaxWorkers = [int]$workersInput }
 
         $DryRun = Confirm-YesNo -Prompt "Dry-run (parse only)?" -Default $false
@@ -193,7 +236,9 @@ if ($Interactive) {
         Write-Log "---- Summary ----"
         Write-Log ("  Preset : {0}" -f $Preset)
         Write-Log ("  BBox   : {0}" -f $(if ($BBox) { $BBox } else { "(none - full)" }))
-        Write-Log ("  GPU    : {0}" -f $(if ($Gpu) { "ON" } else { "off" }))
+        if ($Classic) { Write-Log "  Mode   : classic" }
+        elseif ($Gpu) { Write-Log "  Mode   : dask+gpu" }
+        else { Write-Log "  Mode   : dask (NumPy)" }
         Write-Log ("  Memory : {0}" -f $(if ($MemoryLimit) { $MemoryLimit } else { "default ($defaultMemLimit total)" }))
         Write-Log ("  Workers: {0}" -f $(if ($MaxWorkers -gt 0) { $MaxWorkers } else { "default (2)" }))
         Write-Log ("  DryRun : {0}" -f $(if ($DryRun) { "yes" } else { "no" }))
@@ -313,12 +358,26 @@ if ($LogFile -ne "") { $cliArgs += @("--log-file", $LogFile) }
 if ($MaxWorkers -gt 0) { $cliArgs += @("--max-workers", $MaxWorkers) }
 
 # --- environment -------------------------------------------------------------
-if ($Gpu) {
-    $env:QA4SM_USE_GPU = "1"
-    Write-Log "ENV QA4SM_USE_GPU=1"
-} else {
+# Mode -> env vars. Dask is the default; -Gpu implies -Dask and additionally
+# enables CuPy/NumPy-metric acceleration inside Dask workers; -Classic forces
+# the ThreadPoolExecutor path (escape hatch).
+if ($Classic) {
+    $env:QA4SM_USE_CLASSIC = "1"
+    $env:QA4SM_USE_DASK = "0"
     Remove-Item Env:QA4SM_USE_GPU -ErrorAction SilentlyContinue
+    Write-Log "ENV QA4SM_USE_CLASSIC=1 QA4SM_USE_DASK=0 (classic ThreadPoolExecutor path)"
+} elseif ($Gpu) {
+    $env:QA4SM_USE_DASK = "1"
+    $env:QA4SM_USE_GPU = "1"
+    Remove-Item Env:QA4SM_USE_CLASSIC -ErrorAction SilentlyContinue
+    Write-Log "ENV QA4SM_USE_DASK=1 QA4SM_USE_GPU=1 (Dask streaming + GPU metrics)"
+} else {
+    $env:QA4SM_USE_DASK = "1"
+    $env:QA4SM_USE_GPU = "0"
+    Remove-Item Env:QA4SM_USE_CLASSIC -ErrorAction SilentlyContinue
+    Write-Log "ENV QA4SM_USE_DASK=1 QA4SM_USE_GPU=0 (Dask streaming + NumPy metrics, default)"
 }
+
 if ($MemoryLimit -ne "") {
     $normalizedMem = $MemoryLimit
     if ($MemoryLimit -match '^\d+$') {
@@ -341,6 +400,30 @@ if ($Heartbeat -gt 0) {
 } else {
     Remove-Item Env:QA4SM_HEARTBEAT_INTERVAL_SECONDS -ErrorAction SilentlyContinue
 }
+if ($MaxReadRetries -gt 0) {
+    $env:QA4SM_MAX_READ_RETRIES = "$MaxReadRetries"
+    Write-Log "ENV QA4SM_MAX_READ_RETRIES=$MaxReadRetries"
+} else {
+    Remove-Item Env:QA4SM_MAX_READ_RETRIES -ErrorAction SilentlyContinue
+}
+if ($DaskBatchRetries -gt 0) {
+    $env:QA4SM_DASK_BATCH_RETRIES = "$DaskBatchRetries"
+    Write-Log "ENV QA4SM_DASK_BATCH_RETRIES=$DaskBatchRetries"
+} else {
+    Remove-Item Env:QA4SM_DASK_BATCH_RETRIES -ErrorAction SilentlyContinue
+}
+if ($ThreadTimeout -gt 0) {
+    $env:QA4SM_THREAD_TIMEOUT_SECONDS = "$ThreadTimeout"
+    Write-Log "ENV QA4SM_THREAD_TIMEOUT_SECONDS=$ThreadTimeout"
+} else {
+    Remove-Item Env:QA4SM_THREAD_TIMEOUT_SECONDS -ErrorAction SilentlyContinue
+}
+if ($CacheLoadRetries -gt 0) {
+    $env:QA4SM_CACHE_LOAD_RETRIES = "$CacheLoadRetries"
+    Write-Log "ENV QA4SM_CACHE_LOAD_RETRIES=$CacheLoadRetries"
+} else {
+    Remove-Item Env:QA4SM_CACHE_LOAD_RETRIES -ErrorAction SilentlyContinue
+}
 foreach ($kv in $EnvVar) {
     $eq = $kv.IndexOf("=")
     if ($eq -le 0) {
@@ -353,7 +436,9 @@ foreach ($kv in $EnvVar) {
 }
 
 Write-Log "Running: $runConfig"
-if ($Gpu) { Write-Log "  GPU/Dask path enabled" }
+if ($Classic) { Write-Log "  Classic ThreadPoolExecutor path enabled" }
+elseif ($Gpu) { Write-Log "  Dask streaming + GPU acceleration enabled" }
+else { Write-Log "  Dask streaming + NumPy metrics (default)" }
 Write-Log ("Executing: {0} {1}" -f $python, ($cliArgs -join " "))
 
 & $python @cliArgs
