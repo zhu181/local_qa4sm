@@ -987,10 +987,7 @@ def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
                     short = addr.split(":")[-1] if ":" in addr else addr
                     if mem_limit and process_mem:
                         frac = process_mem / mem_limit
-                        worker_lines.append(
-                            f"{short}={_fmt_bytes(process_mem)}/{_fmt_bytes(mem_limit)} "
-                            f"({frac:.0%})"
-                        )
+                        worker_lines.append(f"{short}={_fmt_bytes(process_mem)}/{_fmt_bytes(mem_limit)} ({frac:.0%})")
                         if frac > 0.7:
                             __logger.warning(
                                 "Dask worker %s memory usage high: %.0f%% "
