@@ -1,7 +1,9 @@
 from datetime import datetime
-from validator.models import ValidationRun
+
 import qa4sm_reader.globals as qr_globals
+
 import validator.settings as settings
+from validator.models import ValidationRun
 
 OUTPUT_FOLDER = settings.MEDIA_ROOT
 
@@ -28,10 +30,10 @@ TC_METRIC_TEMPLATE = [
 ]
 
 STABILITY_METRICS = qr_globals.STABILITY_METRICS
-# -----------------------------------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------
 # TODO: If a new dataset is added here, make sure to add it to
 #  `qa4sm_reader.globals.DATASETS` as well
-# -----------------------------------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------
 C3SC = "C3S_combined"
 C3SA = "C3S_active"
 C3SP = "C3S_passive"
@@ -56,7 +58,7 @@ SMOS_L3 = "SMOS_L3"
 SMOS_L2 = "SMOS_L2"
 SMAP_L2 = "SMAP_L2"
 SMOS_SBPCA = "SMOS_SBPCA"
-# -----------------------------------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------
 
 DATASETS = qr_globals.DATASETS
 

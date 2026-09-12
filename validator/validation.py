@@ -1,67 +1,67 @@
-import netCDF4
-from datetime import datetime
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import ast
 import logging
 import os
 import time
 import uuid
-import ast
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime
+from typing import Any
 
-from typing import List, Tuple, Dict, Union
-
+import netCDF4
+import numpy as np
+import pandas as pd
+import pytz
 from dateutil.tz import tzlocal
-
+from ismn.interface import ISMN_Interface
 from pytesmo.validation_framework.adapters import AnomalyAdapter, AnomalyClimAdapter
 from pytesmo.validation_framework.data_manager import DataManager
 from pytesmo.validation_framework.metric_calculators import (
-    get_dataset_names,
     PairwiseIntercomparisonMetrics,
     TripleCollocationMetrics,
+    get_dataset_names,
 )
-from pytesmo.validation_framework.temporal_matchers import (
-    make_combined_temporal_matcher,
-)
-import pandas as pd
-from pytesmo.validation_framework.results_manager import (
-    netcdf_results_manager,
-)
-from pytesmo.validation_framework.validation import Validation
 from pytesmo.validation_framework.metric_calculators_adapters import (
     SubsetsMetricsAdapter,
     TsDistributor,
 )
-
-from pytz import UTC
-import pytz
-from ismn.interface import ISMN_Interface
-from validator.models import DatasetVersion, ValidationTask
-from validator.models import ValidationRun
-from validator.batches import create_jobs, create_upscaling_lut
-from validator.filters import setup_filtering
-from validator import settings
-from validator.globals import (
-    OUTPUT_FOLDER,
-    IRREGULAR_GRIDS,
-    ISMN,
-    DEFAULT_TSW,
-    TEMPORAL_SUB_WINDOW_SEPARATOR,
-    TEMPORAL_SUB_WINDOWS,
+from pytesmo.validation_framework.results_manager import (
+    netcdf_results_manager,
 )
-
-from validator.readers import create_reader, adapt_timestamp
-from validator.utils import mkdir_if_not_exists, first_file_in
-from validator.globals import START_TIME, END_TIME, METADATA_TEMPLATE
-from validator.adapters import StabilityMetricsAdapter
+from pytesmo.validation_framework.temporal_matchers import (
+    make_combined_temporal_matcher,
+)
+from pytesmo.validation_framework.validation import Validation
+from pytz import UTC
 from qa4sm_reader.intra_annual_temp_windows import (
     TemporalSubWindowsCreator,
     TemporalSubWindowsFactory,
 )
 from qa4sm_reader.netcdf_transcription import Pytesmo2Qa4smResultsTranscriber
+
+from validator import settings
+from validator.adapters import StabilityMetricsAdapter
+from validator.batches import create_jobs, create_upscaling_lut
+from validator.filters import setup_filtering
+from validator.globals import (
+    DEFAULT_TSW,
+    END_TIME,
+    IRREGULAR_GRIDS,
+    ISMN,
+    METADATA_TEMPLATE,
+    OUTPUT_FOLDER,
+    START_TIME,
+    TEMPORAL_SUB_WINDOW_SEPARATOR,
+    TEMPORAL_SUB_WINDOWS,
+)
 from validator.graphics import generate_all_graphs
+from validator.models import DatasetVersion, ValidationRun, ValidationTask
+from validator.readers import adapt_timestamp, create_reader
+from validator.utils import first_file_in, mkdir_if_not_exists
+
 __logger = logging.getLogger(__name__)
 
 
-def _get_actual_time_range(val_run:ValidationRun, dataset_version:DatasetVersion):
+def _get_actual_time_range(val_run: ValidationRun, dataset_version: DatasetVersion):
     try:
         vs_start = dataset_version.time_range_start
         vs_start_time = datetime.strptime(vs_start, "%Y-%m-%d").date()
@@ -78,12 +78,10 @@ def _get_actual_time_range(val_run:ValidationRun, dataset_version:DatasetVersion
             else vs_start_time.strftime("%Y-%m-%d")
         )
         actual_end = (
-            val_end_time.strftime("%Y-%m-%d")
-            if val_end_time < vs_end_time
-            else vs_end_time.strftime("%Y-%m-%d")
+            val_end_time.strftime("%Y-%m-%d") if val_end_time < vs_end_time else vs_end_time.strftime("%Y-%m-%d")
         )
 
-    except:
+    except Exception:
         # exception will arise for ISMN, and for that one we can use entire range
         actual_start = START_TIME
         actual_end = END_TIME
@@ -91,7 +89,7 @@ def _get_actual_time_range(val_run:ValidationRun, dataset_version:DatasetVersion
     return [actual_start, actual_end]
 
 
-def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str, dict]:
+def _get_spatial_reference_reader(val_run: ValidationRun) -> tuple[Any, str, dict]:
     ref_reader = create_reader(
         val_run.spatial_reference_configuration.dataset,
         val_run.spatial_reference_configuration.version,
@@ -103,13 +101,12 @@ def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str
         val_run.spatial_reference_configuration.version,
     )
 
-    # we do the dance with the filtering below because filter may actually change the original reader, see ismn network selection
+    # we do the dance with the filtering below because filter may actually
+    # change the original reader, see ismn network selection
     filtered_reader, read_name, read_kwargs = setup_filtering(
         reader=time_adapted_ref_reader,
         filters=list(val_run.spatial_reference_configuration.filters),
-        param_filters=list(
-            val_run.spatial_reference_configuration.parametrised_filters
-        ),
+        param_filters=list(val_run.spatial_reference_configuration.parametrised_filters),
         dataset=val_run.spatial_reference_configuration.dataset,
         variable=val_run.spatial_reference_configuration.variable,
     )
@@ -120,7 +117,7 @@ def _get_spatial_reference_reader(val_run: ValidationRun) -> Tuple["Reader", str
     return ref_reader, read_name, read_kwargs
 
 
-def set_outfile(validation_run:ValidationRun, run_dir:str):
+def set_outfile(validation_run: ValidationRun, run_dir: str):
     outfile = first_file_in(run_dir, ".nc")
     if outfile is not None:
         out_norm = os.path.normpath(outfile)
@@ -140,7 +137,7 @@ def set_outfile(validation_run:ValidationRun, run_dir:str):
         validation_run.output_file = out_norm
 
 
-def save_validation_config(validation_run:ValidationRun):
+def save_validation_config(validation_run: ValidationRun):
     try:
         with netCDF4.Dataset(
             os.path.join(OUTPUT_FOLDER, validation_run.output_file),
@@ -157,45 +154,35 @@ def save_validation_config(validation_run:ValidationRun):
             if validation_run.interval_from is None:
                 ds.val_interval_from = "N/A"
             else:
-                ds.val_interval_from = validation_run.interval_from.strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+                ds.val_interval_from = validation_run.interval_from.strftime("%Y-%m-%d %H:%M")
 
             if validation_run.interval_to is None:
                 ds.val_interval_to = "N/A"
             else:
-                ds.val_interval_to = validation_run.interval_to.strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+                ds.val_interval_to = validation_run.interval_to.strftime("%Y-%m-%d %H:%M")
 
             j = 1
             for dataset_config in validation_run.dataset_configurations:
                 filters = None
                 if dataset_config.filters:
-                    filters = "; ".join(
-                        [x.description for x in dataset_config.filters]
-                    )
+                    filters = "; ".join([x.description for x in dataset_config.filters])
                 if dataset_config.parametrised_filters:
                     if filters:
                         filters += ";"
                     _list_comp = [
-                        pf.filter.description + " " + pf.parameters
-                        for pf in dataset_config.parametrised_filters
+                        pf.filter.description + " " + pf.parameters for pf in dataset_config.parametrised_filters
                     ]
                     try:
                         filters += "; ".join(_list_comp)
                     except TypeError as e:
-                        __logger.error(
-                            f"Error in save_validation_config: {e}. {filters=}{_list_comp=}"
-                        )
+                        __logger.error(f"Error in save_validation_config: {e}. {filters=}{_list_comp=}")
                         filters = "; ".join(_list_comp)
 
                 if not filters:
                     filters = "N/A"
 
                 if validation_run.spatial_reference_configuration and (
-                    dataset_config.id
-                    == validation_run.spatial_reference_configuration.id
+                    dataset_config.id == validation_run.spatial_reference_configuration.id
                 ):
                     i = 0  # reference is always 0
                 else:
@@ -204,15 +191,9 @@ def save_validation_config(validation_run:ValidationRun):
 
                 # there is no error for variables!!, there were some inconsistency with short and pretty names,
                 # and it should be like that now
-                ds.setncattr(
-                    "val_dc_dataset" + str(i), dataset_config.dataset.short_name
-                )
-                ds.setncattr(
-                    "val_dc_version" + str(i), dataset_config.version.short_name
-                )
-                ds.setncattr(
-                    "val_dc_variable" + str(i), dataset_config.variable.pretty_name
-                )
+                ds.setncattr("val_dc_dataset" + str(i), dataset_config.dataset.short_name)
+                ds.setncattr("val_dc_version" + str(i), dataset_config.version.short_name)
+                ds.setncattr("val_dc_variable" + str(i), dataset_config.variable.pretty_name)
                 ds.setncattr("val_dc_unit" + str(i), dataset_config.variable.unit)
 
                 ds.setncattr(
@@ -233,29 +214,22 @@ def save_validation_config(validation_run:ValidationRun):
                 actual_interval_from, actual_interval_to = _get_actual_time_range(
                     validation_run, dataset_config.version.id
                 )
-                ds.setncattr(
-                    "val_dc_actual_interval_from" + str(i), actual_interval_from
-                )
+                ds.setncattr("val_dc_actual_interval_from" + str(i), actual_interval_from)
                 ds.setncattr("val_dc_actual_interval_to" + str(i), actual_interval_to)
 
                 if (validation_run.spatial_reference_configuration is not None) and (
-                    dataset_config.id
-                    == validation_run.spatial_reference_configuration.id
+                    dataset_config.id == validation_run.spatial_reference_configuration.id
                 ):
                     ds.val_ref = "val_dc_dataset" + str(i)
 
                     try:
                         ds.setncattr(
                             "val_resolution",
-                            validation_run.spatial_reference_configuration.dataset.resolution[
-                                "value"
-                            ],
+                            validation_run.spatial_reference_configuration.dataset.resolution["value"],
                         )
                         ds.setncattr(
                             "val_resolution_unit",
-                            validation_run.spatial_reference_configuration.dataset.resolution[
-                                "unit"
-                            ],
+                            validation_run.spatial_reference_configuration.dataset.resolution["unit"],
                         )
                     # ISMN has null resolution attribute, therefore
                     # we write no output resolution
@@ -263,29 +237,21 @@ def save_validation_config(validation_run:ValidationRun):
                     except (AttributeError, TypeError):
                         pass
 
-                if (validation_run.scaling_ref is not None) and (
-                    dataset_config.id == validation_run.scaling_ref.id
-                ):
+                if (validation_run.scaling_ref is not None) and (dataset_config.id == validation_run.scaling_ref.id):
                     ds.val_scaling_ref = "val_dc_dataset" + str(i)
 
                 if dataset_config.dataset.short_name in IRREGULAR_GRIDS.keys():
                     grid_stepsize = IRREGULAR_GRIDS[dataset_config.dataset.short_name]
                 else:
                     grid_stepsize = "nan"
-                ds.setncattr(
-                    "val_dc_dataset" + str(i) + "_grid_stepsize", grid_stepsize
-                )
+                ds.setncattr("val_dc_dataset" + str(i) + "_grid_stepsize", grid_stepsize)
 
             ds.val_scaling_method = validation_run.scaling_method
 
             ds.val_anomalies = validation_run.anomalies
             if validation_run.anomalies == ValidationRun.CLIMATOLOGY:
-                ds.val_anomalies_from = validation_run.anomalies_from.strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-                ds.val_anomalies_to = validation_run.anomalies_to.strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+                ds.val_anomalies_from = validation_run.anomalies_from.strftime("%Y-%m-%d %H:%M")
+                ds.val_anomalies_to = validation_run.anomalies_to.strftime("%Y-%m-%d %H:%M")
 
             if all(
                 x is not None
@@ -296,18 +262,102 @@ def save_validation_config(validation_run:ValidationRun):
                     validation_run.max_lon,
                 ]
             ):
-                ds.val_spatial_subset = "[{}, {}, {}, {}]".format(
-                    validation_run.min_lat,
-                    validation_run.min_lon,
-                    validation_run.max_lat,
-                    validation_run.max_lon,
+                ds.val_spatial_subset = (
+                    f"[{validation_run.min_lat}, {validation_run.min_lon}, "
+                    f"{validation_run.max_lat}, {validation_run.max_lon}]"
                 )
 
     except Exception:
         __logger.exception("Validation configuration could not be stored.")
 
 
-def create_pytesmo_validation(validation_run:ValidationRun):
+def _apply_anomaly_adapter(reader, validation_run, dataset_config, read_name):
+    if validation_run.anomalies == ValidationRun.MOVING_AVG_35_D:
+        return AnomalyAdapter(
+            reader,
+            window_size=35,
+            columns=[dataset_config.variable.short_name],
+            read_name=read_name,
+        )
+    if validation_run.anomalies == ValidationRun.CLIMATOLOGY:
+        anomalies_baseline = [
+            validation_run.anomalies_from.astimezone(tz=pytz.UTC).replace(tzinfo=None),
+            validation_run.anomalies_to.astimezone(tz=pytz.UTC).replace(tzinfo=None),
+        ]
+        return AnomalyClimAdapter(
+            reader,
+            columns=[dataset_config.variable.short_name],
+            timespan=anomalies_baseline,
+            read_name=read_name,
+        )
+    return reader
+
+
+def _setup_metric_calculators(
+    ds_num, ds_names, validation_run, metadata_template, temp_sub_wdws, temp_sub_wdw_instance, spatial_ref_name
+):
+    _pairwise_metrics = PairwiseIntercomparisonMetrics(
+        metadata_template=metadata_template,
+        calc_kendall=False,
+    )
+
+    if validation_run.intra_annual_metrics and validation_run.stability_metrics:
+        raise ValueError("Both intra_annual_metrics and stability_metrics cannot be True at the same time.")
+
+    tsw_metrics = None
+    if validation_run.intra_annual_metrics:
+        tsw_metrics = "intra_annual"
+    elif validation_run.stability_metrics:
+        tsw_metrics = "stability"
+
+    if tsw_metrics:
+        if isinstance(temp_sub_wdws, dict):
+            adapter_cls = StabilityMetricsAdapter if tsw_metrics == "stability" else SubsetsMetricsAdapter
+            pairwise_metrics = adapter_cls(
+                calculator=_pairwise_metrics,
+                subsets=temp_sub_wdw_instance.custom_temporal_sub_windows,
+                group_results="join",
+            )
+    else:
+        pairwise_metrics = _pairwise_metrics
+
+    metric_calculators = {(ds_num, 2): pairwise_metrics.calc_metrics}
+
+    if (len(ds_names) >= 3) and (validation_run.tcol is True):
+        _tcol_metrics = TripleCollocationMetrics(
+            spatial_ref_name,
+            metadata_template=metadata_template,
+            bootstrap_cis=validation_run.bootstrap_tcol_cis,
+        )
+        if isinstance(temp_sub_wdws, dict):
+            tcol_metrics = SubsetsMetricsAdapter(
+                calculator=_tcol_metrics,
+                subsets=temp_sub_wdw_instance.custom_temporal_sub_windows,
+                group_results="join",
+            )
+        elif temp_sub_wdws is None:
+            tcol_metrics = _tcol_metrics
+        metric_calculators.update({(ds_num, 3): tcol_metrics.calc_metrics})
+
+    return metric_calculators
+
+
+def _setup_upscaling(validation_run, datasets, spatial_ref_name):
+    if validation_run.upscaling_method == "none":
+        return None
+    upscale_parms = {
+        "upscaling_method": validation_run.upscaling_method,
+        "temporal_stability": validation_run.temporal_stability,
+    }
+    upscale_parms["upscaling_lut"] = create_upscaling_lut(
+        validation_run=validation_run,
+        datasets=datasets,
+        spatial_ref_name=spatial_ref_name,
+    )
+    return upscale_parms
+
+
+def create_pytesmo_validation(validation_run: ValidationRun, read_bulk: bool = True):
     ds_list = []
     ds_read_names = []
     spatial_ref_name = None
@@ -317,12 +367,11 @@ def create_pytesmo_validation(validation_run:ValidationRun):
 
     ds_num = 1
     for dataset_config in validation_run.dataset_configurations:
-        reader = create_reader(dataset_config.dataset, dataset_config.version)
-
-        time_adapted_reader = adapt_timestamp(
-            reader, dataset_config.dataset, dataset_config.version
-        )
-
+        # The Dask GPU path deserializes readers fresh on every batch; a bulk read
+        # would load the whole dataset into RAM per batch. Read targeted slices
+        # instead (the classic path keeps read_bulk=True).
+        reader = create_reader(dataset_config.dataset, dataset_config.version, read_bulk=read_bulk)
+        time_adapted_reader = adapt_timestamp(reader, dataset_config.dataset, dataset_config.version)
         reader, read_name, read_kwargs = setup_filtering(
             reader=time_adapted_reader,
             filters=list(dataset_config.filters),
@@ -330,38 +379,18 @@ def create_pytesmo_validation(validation_run:ValidationRun):
             dataset=dataset_config.dataset,
             variable=dataset_config.variable,
         )
+        reader = _apply_anomaly_adapter(reader, validation_run, dataset_config, read_name)
 
-        if validation_run.anomalies == ValidationRun.MOVING_AVG_35_D:
-            reader = AnomalyAdapter(
-                reader,
-                window_size=35,
-                columns=[dataset_config.variable.short_name],
-                read_name=read_name,
-            )
-        if validation_run.anomalies == ValidationRun.CLIMATOLOGY:
-            # make sure our baseline period is in UTC and without timezone information
-            anomalies_baseline = [
-                validation_run.anomalies_from.astimezone(tz=pytz.UTC).replace(
-                    tzinfo=None
-                ),
-                validation_run.anomalies_to.astimezone(tz=pytz.UTC).replace(
-                    tzinfo=None
-                ),
-            ]
-            reader = AnomalyClimAdapter(
-                reader,
-                columns=[dataset_config.variable.short_name],
-                timespan=anomalies_baseline,
-                read_name=read_name,
-            )
-
-        if validation_run.spatial_reference_configuration and (
-            dataset_config.id == validation_run.spatial_reference_configuration.id
-        ):
-            # reference is always named "0-..."
-            dataset_name = "{}-{}".format(0, dataset_config.dataset.short_name)
-        else:
-            dataset_name = "{}-{}".format(ds_num, dataset_config.dataset.short_name)
+        is_spatial_ref = (
+            validation_run.spatial_reference_configuration
+            and dataset_config.id == validation_run.spatial_reference_configuration.id
+        )
+        dataset_name = (
+            f"0-{dataset_config.dataset.short_name}"
+            if is_spatial_ref
+            else f"{ds_num}-{dataset_config.dataset.short_name}"
+        )
+        if not is_spatial_ref:
             ds_num += 1
 
         ds_list.append(
@@ -377,49 +406,22 @@ def create_pytesmo_validation(validation_run:ValidationRun):
         )
         ds_read_names.append((dataset_name, read_name))
 
-        if validation_run.spatial_reference_configuration and (
-            dataset_config.id == validation_run.spatial_reference_configuration.id
-        ):
+        if is_spatial_ref:
             spatial_ref_name = dataset_name
-            spatial_ref_short_name = (
-                validation_run.spatial_reference_configuration.dataset.short_name
-            )
-
-        if validation_run.scaling_ref and (
-            dataset_config.id == validation_run.scaling_ref.id
-        ):
+            spatial_ref_short_name = dataset_config.dataset.short_name
+        if validation_run.scaling_ref and dataset_config.id == validation_run.scaling_ref.id:
             scaling_ref_name = dataset_name
-
-        if validation_run.temporal_reference_configuration and (
-            dataset_config.id == validation_run.temporal_reference_configuration.id
+        if (
+            validation_run.temporal_reference_configuration
+            and dataset_config.id == validation_run.temporal_reference_configuration.id
         ):
             temporal_ref_name = dataset_name
 
     datasets = dict(ds_list)
     ds_num = len(ds_list)
-
     period = get_period(validation_run)
 
-    __logger.debug(f"First: Validation period: {period}")
-    upscale_parms = None
-    if validation_run.upscaling_method != "none":
-        __logger.debug("Upscaling option is active")
-        upscale_parms = {
-            "upscaling_method": validation_run.upscaling_method,
-            "temporal_stability": validation_run.temporal_stability,
-        }
-        upscaling_lut = create_upscaling_lut(
-            validation_run=validation_run,
-            datasets=datasets,
-            spatial_ref_name=spatial_ref_name,
-        )
-        upscale_parms["upscaling_lut"] = upscaling_lut
-        __logger.debug(
-            "Lookup table for non-reference datasets "
-            + ", ".join(upscaling_lut.keys())
-            + " created"
-        )
-        __logger.debug("{}".format(upscaling_lut))
+    upscale_parms = _setup_upscaling(validation_run, datasets, spatial_ref_name)
 
     datamanager = DataManager(
         datasets,
@@ -428,127 +430,32 @@ def create_pytesmo_validation(validation_run:ValidationRun):
         read_ts_names=dict(ds_read_names),
         upscale_parms=upscale_parms,
     )
-    ds_names = get_dataset_names(
-        datamanager.reference_name, datamanager.datasets, n=ds_num
+    ds_names = get_dataset_names(datamanager.reference_name, datamanager.datasets, n=ds_num)
+
+    metadata_template = METADATA_TEMPLATE["ismn_ref" if spatial_ref_short_name == ISMN else "other_ref"]
+
+    tsw_dict = define_tsw_metrics(validation_run, period)
+    temp_sub_wdw_instance = tsw_dict["temp_sub_wdw_instance"]
+    temp_sub_wdws = tsw_dict["temp_sub_wdws"]
+
+    metric_calculators = _setup_metric_calculators(
+        ds_num,
+        ds_names,
+        validation_run,
+        metadata_template,
+        temp_sub_wdws,
+        temp_sub_wdw_instance,
+        spatial_ref_name,
     )
 
-    # set value of the metadata template according to what reference dataset is used
-    if spatial_ref_short_name == ISMN:
-        metadata_template = METADATA_TEMPLATE["ismn_ref"]
-    else:
-        metadata_template = METADATA_TEMPLATE["other_ref"]
-
-    _pairwise_metrics = PairwiseIntercomparisonMetrics(
-        metadata_template=metadata_template,
-        calc_kendall=False,
+    scaling_method = (
+        None if validation_run.scaling_method == validation_run.NO_SCALING else validation_run.scaling_method
     )
-
-    # as all testfiles and tests in the qa4sm_reader package still have Kendall's tau included and
-    # qa4sm get's its list of METRICS from the qa4sm_reader.globals.py. In the line above "calc_kendall=False", which
-    # means that in the qa4sm_reader.globals.py the METRICS needs to be manually set to exclude Kendall's tau.
-    # to streamline the process, smth like this could be done:
-
-    # if all(metric in METRICS for metric in ['tau', 'p_tau']):
-    #   _calc_kendall = True
-    # else:
-    #  _calc_kendall = False
-
-    # _pairwise_metrics = PairwiseIntercomparisonMetrics(
-    #     metadata_template=metadata_template,
-    #     calc_kendall=_calc_kendall,
-    # )
-
-    # TODO: this should be move to the api view
-    if validation_run.intra_annual_metrics and validation_run.stability_metrics:
-        raise ValueError(
-            "Both intra_annual_metrics and stability_metrics cannot be True at the same time."
-        )
-
-    tsw_metrics = None
-    temp_sub_wdws = None
-
-    if validation_run.intra_annual_metrics:
-        tsw_metrics = "intra_annual"
-    elif validation_run.stability_metrics:
-        tsw_metrics = "stability"
-
-    if tsw_metrics:
-        tsw_dict = define_tsw_metrics(validation_run, period)
-        temp_sub_wdw_instance = tsw_dict["temp_sub_wdw_instance"]
-        temp_sub_wdws = tsw_dict["temp_sub_wdws"]
-
-        # Proceed only if temp_sub_wdws is a dictionary
-        if isinstance(temp_sub_wdws, dict):
-            if tsw_metrics == "intra_annual":
-                # Set up Intra-annual metrics
-                pairwise_metrics = SubsetsMetricsAdapter(
-                    calculator=_pairwise_metrics,
-                    subsets=temp_sub_wdw_instance.custom_temporal_sub_windows,
-                    group_results="join",
-                )
-
-            elif tsw_metrics == "stability":
-                # Set up Stability metrics
-                pairwise_metrics = StabilityMetricsAdapter(
-                    calculator=_pairwise_metrics,
-                    subsets=temp_sub_wdw_instance.custom_temporal_sub_windows,
-                    group_results="join",
-                )
-
-    else:
-        # Default case when tsw_metrics is None
-        if temp_sub_wdws is None:
-            pairwise_metrics = _pairwise_metrics
-        else:
-            raise ValueError(
-                f"Invalid value for temp_sub_wdws: {temp_sub_wdws}. "
-                "Please specify either None or a custom temporal sub windowing function."
-            )
-
-    try:
-        metric_calculators = {(ds_num, 2): pairwise_metrics.calc_metrics}
-    except Exception as e:
-        print(e)
-
-    if (len(ds_names) >= 3) and (validation_run.tcol is True):
-        _tcol_metrics = TripleCollocationMetrics(
-            spatial_ref_name,
-            metadata_template=metadata_template,
-            bootstrap_cis=validation_run.bootstrap_tcol_cis,
-        )
-
-        if isinstance(temp_sub_wdws, dict):
-            tcol_metrics = SubsetsMetricsAdapter(
-                calculator=_tcol_metrics,
-                subsets=temp_sub_wdw_instance.custom_temporal_sub_windows,
-                group_results="join",
-            )
-
-        elif temp_sub_wdws is None:
-            tcol_metrics = _tcol_metrics
-
-        metric_calculators.update({(ds_num, 3): tcol_metrics.calc_metrics})
-
-    if validation_run.scaling_method == validation_run.NO_SCALING:
-        scaling_method = None
-    else:
-        scaling_method = validation_run.scaling_method
-
-    __logger.debug(f"Scaling method: {scaling_method}")
-    __logger.debug(f"Scaling dataset: {scaling_ref_name}")
-    __logger.debug(f"Validation period: {period}")
-
     temporalwindow_size = validation_run.temporal_matching
-    __logger.debug(
-        f"Size of the temporal matching window: {temporalwindow_size} "
-        f"{'hour' if temporalwindow_size == 1 else 'hours'}"
-    )
 
     val = Validation(
         datasets=datamanager,
-        temporal_matcher=make_combined_temporal_matcher(  # ? do i have to update that for intra-annual metrics?
-            pd.Timedelta(temporalwindow_size / 2, "h")
-        ),
+        temporal_matcher=make_combined_temporal_matcher(pd.Timedelta(temporalwindow_size / 2, "h")),
         temporal_ref=temporal_ref_name,
         spatial_ref=spatial_ref_name,
         scaling=scaling_method,
@@ -556,30 +463,26 @@ def create_pytesmo_validation(validation_run:ValidationRun):
         metrics_calculators=metric_calculators,
         period=period,
     )
-
     return val
 
 
 def num_gpis_from_job(job):
     try:
         num_gpis = len(job[0])
-    except:
+    except Exception:
         num_gpis = 1
 
     return num_gpis
 
 
-def execute_job(
-    validation_run, job, task_id=None, max_retries=1, retry_delay_seconds=1
-):
+def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_seconds=1):
     if task_id is None:
         task_id = uuid.uuid4().hex
     numgpis = num_gpis_from_job(job)
     for attempt in range(max_retries + 1):
         __logger.debug(
-            "Executing job {} from validation {}, # of gpis: {}, attempt {}/{}".format(
-                task_id, validation_run.id, numgpis, attempt + 1, max_retries + 1
-            )
+            f"Executing job {task_id} from validation {validation_run.id}, "
+            f"# of gpis: {numgpis}, attempt {attempt + 1}/{max_retries + 1}"
         )
         start_time = datetime.now(tzlocal())
         try:
@@ -590,35 +493,42 @@ def execute_job(
                 rename_cols=False,
                 only_with_reference=True,
                 handle_errors="ignore",
+                use_gpu=settings.USE_GPU,
+                max_read_retries=settings.MAX_READ_RETRIES,
+                retry_delay_seconds=settings.READ_RETRY_DELAY_SECONDS,
             )
             end_time = datetime.now(tzlocal())
             duration = end_time - start_time
             duration = (duration.days * 86400) + duration.seconds
             __logger.debug(
-                "Finished job {} from validation {}, took {} seconds for {} gpis".format(
-                    task_id, validation_run.id, duration, numgpis
-                )
+                f"Finished job {task_id} from validation {validation_run.id}, "
+                f"took {duration} seconds for {numgpis} gpis"
             )
             return result
         except Exception as e:
+            # Handle non-retriable KeyError cases (missing DataFrame columns)
             if isinstance(e, KeyError) and str(e).strip("'") in {"gpi", "frm_class", "status"}:
                 __logger.warning(
-                    "Job {} from validation {} hit non-retriable key error {}. "
-                    "Marking job as empty result and continuing.".format(
-                        task_id, validation_run.id, e
-                    )
+                    f"Job {task_id} from validation {validation_run.id} hit non-retriable key error {e}. "
+                    "Marking job as empty result and continuing."
+                )
+                return {}
+            # Handle pytesmo TripleCollocationMetrics bug with empty DataFrames
+            if isinstance(e, ValueError) and "list.remove(x): x not in list" in str(e):
+                __logger.warning(
+                    "Job %s hit pytesmo tcol bug (empty DataFrame for dummy result). Returning empty result.",
+                    task_id,
                 )
                 return {}
             if attempt < max_retries:
                 __logger.warning(
-                    "Job {} from validation {} failed on attempt {}/{}: {}. Retrying in {} seconds.".format(
-                        task_id,
-                        validation_run.id,
-                        attempt + 1,
-                        max_retries + 1,
-                        e,
-                        retry_delay_seconds,
-                    )
+                    "Job %s failed on attempt %s/%s (%s: %s). Retrying in %ss.",
+                    task_id,
+                    attempt + 1,
+                    max_retries + 1,
+                    type(e).__name__,
+                    str(e)[:120],
+                    retry_delay_seconds,
                 )
                 time.sleep(retry_delay_seconds)
                 continue
@@ -627,17 +537,24 @@ def execute_job(
 
 def check_and_store_results(job_id, results, save_path):
     if len(results) < 1:
-        __logger.warning("Potentially problematic job: {} - no results".format(job_id))
+        __logger.warning(f"Potentially problematic job: {job_id} - no results")
         return
 
     try:
         netcdf_results_manager(results, save_path)
     except OSError as exc:
-        # A stale/corrupted nc file from a previous interrupted run can break appends.
+        # netCDF4 raises plain OSError (and subclasses) for file/format
+        # problems — there is no dedicated ``netCDF4.NetCDFError``. A
+        # stale/corrupted nc file from a previous interrupted run can break
+        # appends; the message strings below cover the cases the qa4sm
+        # codebase has actually seen in the wild.
         msg = str(exc)
         recoverable = (
             "NetCDF: Unknown file format" in msg
             or "NetCDF: Write to read only" in msg
+            or "NetCDF: HDF error" in msg
+            or "NetCDF: file" in msg
+            and "not found" in msg
         )
         if not recoverable:
             raise
@@ -661,6 +578,87 @@ def check_and_store_results(job_id, results, save_path):
         raise
 
 
+def _reopen_netcdf_or_delete(path: str) -> None:
+    """Validate every .nc file in a directory by reopening it for reading.
+
+    ``path`` is the run directory (the same argument passed to
+    ``check_and_store_results`` / ``netcdf_results_manager``). Each
+    ``*.nc`` file inside is reopened read-only; if the reopen raises a
+    non-Permission OSError (silently corrupted file), the file is deleted
+    so the next write recreates it cleanly. This guards against the
+    C-level netCDF4 crashes observed when a run is killed mid-append.
+
+    Transient errors (file still being written by another worker,
+    PermissionError on Windows file-locks) are NOT treated as corruption —
+    they re-raise so the caller can retry on the next flush.
+    """
+    if not os.path.isdir(path):
+        # Legacy / single-file mode — pass through to the original logic.
+        target = path
+        targets = [path]
+    else:
+        targets = [os.path.join(path, name) for name in os.listdir(path) if name.endswith(".nc")]
+
+    for target in targets:
+        if not os.path.exists(target):
+            continue
+        try:
+            with netCDF4.Dataset(target, "r"):
+                pass
+        except PermissionError as exc:
+            # File is open by another writer (Dask worker, or a flush
+            # still in flight). Not corruption — propagate so the next
+            # flush retries.
+            raise PermissionError(f"netCDF file {target} is busy ({exc}); will retry on next flush") from exc
+        except OSError as exc:
+            __logger.warning(
+                "netCDF file %s failed reopen-validation (%s: %s); deleting and forcing recreate.",
+                target,
+                type(exc).__name__,
+                str(exc)[:120],
+            )
+            try:
+                os.remove(target)
+            except OSError:
+                __logger.warning("Could not remove corrupted netCDF file %s", target)
+
+
+def _enqueue_or_flush_results(
+    job_id: str,
+    results: dict,
+    save_path: str,
+    queue: list,
+    flush_threshold: int = 10,
+    flush_interval_seconds: float = 30.0,
+) -> None:
+    """Coalesce result writes to reduce netCDF open/append/close cycles.
+
+    Each ``check_and_store_results`` call opens the run netCDF, appends the
+    batch, and closes. On long classic-path runs the repeated open/close
+    cycles against an increasingly large file (many variables + many rows)
+    are the most likely trigger for the C-level ``STATUS_ACCESS_VIOLATION``
+    seen inside the netCDF4 native DLL. Queuing up to ``flush_threshold``
+    results before a single ``netcdf_results_manager`` write cuts those
+    cycles by an order of magnitude.
+    """
+    queue.append((job_id, results, save_path))
+    if len(queue) >= flush_threshold:
+        _flush_results_queue(queue)
+
+
+def _flush_results_queue(queue: list) -> None:
+    """Drain the write queue with a single consolidated netCDF append per batch."""
+    while queue:
+        job_id, results, save_path = queue.pop(0)
+        check_and_store_results(job_id, results, save_path)
+        try:
+            _reopen_netcdf_or_delete(save_path)
+        except PermissionError as exc:
+            # Another worker may still have the file open during streaming.
+            # Log once and continue — the next flush will retry.
+            __logger.debug("%s", exc)
+
+
 def track_validation_task(validation_run, task_id):
     validation_task = ValidationTask()
     validation_task.validation = validation_run
@@ -679,112 +677,585 @@ def untrack_validation_task(task_id):
         validation_task = ValidationTask.objects.get(task_id=task_id)
         validation_task.delete()
     except ValidationTask.DoesNotExist:
-        __logger.debug("Task {} already deleted from db.".format(task_id))
+        __logger.debug(f"Task {task_id} already deleted from db.")
 
 
-def run_validation(validation_run:ValidationRun):
-    __logger.info("Starting validation: {}".format(validation_run.id))
-    validation_aborted = False
+def _count_job_status(results: dict, ngpis: int) -> tuple[int, int]:
+    result_key = list(results.keys())[0]
+    res = results[result_key]
+    status_keys = [s for s in res if "status" in s and not s.split("|")[0].isdigit()]
+    ok = res[status_keys[0]] == 0
+    for sk in status_keys[1:]:
+        ok = ok & (res[sk] == 0)
+    nok = sum(ok)
+    return nok, ngpis - nok
 
+
+def _process_job_result(task_id, future, job_table, validation_run, run_dir, write: bool = True):
+    results = future.result()
+    if not results:
+        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+        return None
+
+    results = _pytesmo_to_qa4sm_results(results)
+    if write:
+        check_and_store_results(task_id, results, run_dir)
+
+    ngpis = num_gpis_from_job(job_table[task_id])
+    ok_pts, error_pts = _count_job_status(results, ngpis)
+    validation_run.ok_points += ok_pts
+    validation_run.error_points += error_pts
+    return results
+
+
+def _extend_transcriber_datasets(validation_run):
+    """
+    Extend the qa4sm_reader transcriber's hard-coded DATASETS list with the
+    dataset short names actually used in this run.
+
+    Pytesmo2Qa4smResultsTranscriber.is_valid_tcol_metric_name() only accepts
+    tcol metric names whose ``{number}-{dataset}`` prefix matches a dataset in
+    the static ``qa4sm_reader.globals.DATASETS`` list. Datasets not in that list
+    (e.g. SPL3SMPE, NSMCSMC) would have their tcol metrics (beta/snr/err_std)
+    silently dropped during transcription. Patching the ``netcdf_transcription``
+    module namespace (the one the method reads at call time) fixes that.
+    """
     try:
-        run_dir = os.path.join(OUTPUT_FOLDER, str(validation_run.id))
-        mkdir_if_not_exists(run_dir)
+        import qa4sm_reader.netcdf_transcription as qa4sm_transcription
+    except ImportError:
+        return
 
-        # Clear stale netCDF outputs when reusing the same validation id.
-        stale_nc_files = [
-            os.path.join(run_dir, name)
-            for name in os.listdir(run_dir)
-            if name.endswith(".nc")
-        ]
-        if stale_nc_files:
-            for nc_file in stale_nc_files:
-                try:
-                    os.remove(nc_file)
-                except OSError:
-                    __logger.warning("Could not remove stale netCDF file %s", nc_file)
-            __logger.info(
-                "Removed %s stale netCDF file(s) from %s before starting validation.",
-                len(stale_nc_files),
-                run_dir,
-            )
+    short_names = {validation_run.spatial_reference_configuration.dataset.short_name}
+    for cfg in validation_run.dataset_configurations:
+        short_names.add(cfg.dataset.short_name)
 
-        ref_reader, read_name, read_kwargs = _get_spatial_reference_reader(
-            validation_run
-        )
-
-        total_points, jobs = create_jobs(
-            validation_run=validation_run,
-            reader=ref_reader,
-            dataset_config=validation_run.spatial_reference_configuration,
-        )
-
-        validation_run.total_points = total_points
-
-        __logger.debug("Jobs to run: {}".format([job[:-1] for job in jobs]))
-
-        save_path = run_dir
-
-        configured_workers = getattr(
-            settings, "MAX_PARALLEL_WORKERS", os.cpu_count() or 1
-        )
-        max_workers = max(1, min(len(jobs), configured_workers))
-        if isinstance(ref_reader, ISMN_Interface) and max_workers > 1:
-            __logger.warning(
-                "ISMN reference reader is not safe for threaded execution in this runtime. "
-                "Forcing max_workers=1 to keep validation stable."
-            )
-            max_workers = 1
+    new_datasets = [name for name in sorted(short_names) if name not in qa4sm_transcription.DATASETS]
+    if new_datasets:
+        qa4sm_transcription.DATASETS = qa4sm_transcription.DATASETS + new_datasets
         __logger.info(
-            "Running validation {} with {} parallel workers.".format(
-                validation_run.id, max_workers
-            )
+            "Extended qa4sm_reader transcriber DATASETS with %s so tcol metrics are kept for all datasets.",
+            new_datasets,
         )
-        total_jobs = len(jobs)
-        run_started_at = time.monotonic()
-        last_heartbeat_at = run_started_at
-        heartbeat_interval = getattr(settings, "HEARTBEAT_INTERVAL_SECONDS", 60)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task_id = {}
-            job_table = {}
 
-            for j in jobs:
-                task_id = uuid.uuid4().hex
-                future = executor.submit(execute_job, validation_run, j, task_id)
-                future_to_task_id[future] = task_id
-                job_table[task_id] = j
-                track_validation_task(validation_run, task_id)
+def _post_process_run(validation_run, run_dir, results):
+    set_outfile(validation_run, run_dir)
+    iam_dict = define_tsw_metrics(validation_run, get_period(validation_run))
+    temp_sub_wdw_instance = iam_dict["temp_sub_wdw_instance"]
+    temp_sub_wdws = iam_dict["temp_sub_wdws"]
 
-            pending = set(future_to_task_id.keys())
+    _extend_transcriber_datasets(validation_run)
+
+    transcriber = Pytesmo2Qa4smResultsTranscriber(
+        pytesmo_results=os.path.join(OUTPUT_FOLDER, validation_run.output_file),
+        intra_annual_slices=temp_sub_wdw_instance,
+        keep_pytesmo_ncfile=False,
+    )
+    if not transcriber.exists:
+        return
+
+    _outname, outname_zarr = transcriber.build_outname(run_dir, results.keys())
+    transcriber.output_file_name = str(_outname)
+    transcriber.output_zarr_name = str(outname_zarr)
+    # Initialize transcribed_dataset before writing — write_to_netcdf relies on
+    # self.transcribed_dataset which is only populated by get_transcribed_dataset()
+    transcriber.get_transcribed_dataset()
+    transcriber.write_to_netcdf(transcriber.output_file_name)
+    save_validation_config(validation_run)
+    transcriber.compress(path=transcriber.output_file_name, compression="zlib", complevel=9)
+
+    temporal_sub_windows_names = [DEFAULT_TSW] if temp_sub_wdws is None else temp_sub_wdw_instance.names
+    __logger.info(f"temporal_sub_windows_names: {temporal_sub_windows_names}")
+
+    generate_all_graphs(
+        validation_run=validation_run,
+        outfolder=run_dir,
+        temporal_sub_windows=temporal_sub_windows_names,
+        save_metadata=validation_run.plots_save_metadata,
+    )
+
+
+def _clear_stale_outputs(run_dir):
+    stale = [os.path.join(run_dir, name) for name in os.listdir(run_dir) if name.endswith(".nc")]
+    if not stale:
+        return
+    for nc_file in stale:
+        try:
+            os.remove(nc_file)
+        except OSError:
+            __logger.warning("Could not remove stale netCDF file %s", nc_file)
+    __logger.info(
+        "Removed %s stale netCDF file(s) from %s before starting validation.",
+        len(stale),
+        run_dir,
+    )
+
+
+def _determine_max_workers(jobs, ref_reader):
+    configured = getattr(settings, "MAX_PARALLEL_WORKERS", os.cpu_count() or 1)
+    max_workers = max(1, min(len(jobs), configured))
+    if isinstance(ref_reader, ISMN_Interface) and max_workers > 1:
+        __logger.warning("ISMN reference reader is not safe for threaded execution. Forcing max_workers=1.")
+        max_workers = 1
+    return max_workers
+
+
+def _dask_requested() -> bool:
+    """True when the Dask streaming path should be used.
+
+    Dask is now the default parallel backend (QA4SM_USE_DASK=1). It is also
+    implied by QA4SM_USE_GPU=1 — the GPU path runs through Dask workers. The
+    classic ThreadPoolExecutor path is opt-in via QA4SM_USE_CLASSIC=1 (paired
+    with QA4SM_USE_DASK=0).
+    """
+    if getattr(settings, "USE_CLASSIC", False):
+        return False
+    return bool(getattr(settings, "USE_DASK", True)) or bool(getattr(settings, "USE_GPU", False))
+
+
+def _gpu_dask_requested() -> bool:
+    """True when the Dask streaming path should run GPU-accelerated metrics.
+
+    Kept for backward compatibility — callers that check the old name continue
+    to work. Use ``_dask_requested()`` for the path selection itself.
+    """
+    if not _dask_requested():
+        return False
+    if not getattr(settings, "USE_GPU", False):
+        return False
+    # Verify CuPy/CUDA is actually usable before declaring GPU mode. The Dask
+    # path still runs (NumPy metrics) when this fails — we just downgrade
+    # USE_GPU so the metrics layer falls back to NumPy silently.
+    try:
+        from pytesmo.gpu import is_gpu_available
+
+        available = is_gpu_available()
+    except ImportError:
+        available = False
+    if not available:
+        __logger.warning(
+            "QA4SM_USE_GPU is set but no GPU/CuPy is available. Running the Dask streaming path with NumPy metrics."
+        )
+        settings.USE_GPU = False
+    return True
+
+
+def _dask_memory_limit(n_workers=1):
+    """Per-worker memory limit for the Dask GPU path.
+
+    When ``QA4SM_DASK_MEMORY_LIMIT`` is set, it is treated as the **total**
+    budget for all workers and divided equally.  When unset, each worker
+    defaults to 4 GB.  Dask's default "auto" (~40 %) is too tight for
+    memory-hungry readers and triggers ``KilledWorker``.
+    """
+    limit = getattr(settings, "DASK_MEMORY_LIMIT", None)
+    if limit is not None:
+        if isinstance(limit, str):
+            from dask.utils import parse_bytes
+
+            total_bytes = parse_bytes(limit)
+        else:
+            total_bytes = int(limit)
+        return max(1, total_bytes // max(1, n_workers))
+    return 4 * 1024**3
+
+
+_RUNTIME_FIELDS = {
+    "id",
+    "name_tag",
+    "total_points",
+    "error_points",
+    "ok_points",
+    "output_file",
+    "progress",
+}
+
+
+def _config_hash(validation_run) -> str:
+    """Stable hash of the validation config for resume-cache keying.
+
+    Excludes run-specific/runtime fields (id, point counters, output file) and
+    any callable/back-reference attributes (e.g. bound `save` methods, parent
+    run back-refs) so that re-running the *same* config reuses the same Dask
+    batch cache while any config change (datasets, interval, bbox, metrics)
+    starts a fresh one.
+    """
+    import hashlib
+
+    data = {k: v for k, v in vars(validation_run).items() if k not in _RUNTIME_FIELDS and not callable(v)}
+    return hashlib.sha1(repr(data).encode("utf-8")).hexdigest()[:16]
+
+
+def _dask_batch_cache_path(validation_run) -> str:
+    """Per-config Dask batch zarr cache dir (resume source for the GPU path).
+
+    The cache is also namespaced by batch size: batch boundaries depend on
+    DASK_BATCH_SIZE, so a cache written with a different batch size would
+    misalign gpis across resumed batches. A batch-size change therefore starts
+    a fresh cache dir (the old one is left unused, not corrupted).
+    """
+    cache_root = os.path.join(OUTPUT_FOLDER, ".dask_batch_cache")
+    path = os.path.join(cache_root, f"{_config_hash(validation_run)}_b{settings.DASK_BATCH_SIZE}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _format_eta(elapsed_seconds: float, done: int, total: int) -> str:
+    if done <= 0 or total <= 0:
+        return "n/a"
+    rate = done / max(elapsed_seconds, 1e-6)
+    remaining = (total - done) / rate
+    return _format_duration(remaining)
+
+
+def _format_progress(done: int, total: int, elapsed_seconds: float, unit: str = "gpis") -> str:
+    pct = 100.0 * done / total if total else 0.0
+    return (
+        f"{done:,}/{total:,} {unit} ({pct:.1f}%) "
+        f"elapsed={_format_duration(elapsed_seconds)} ETA≈{_format_eta(elapsed_seconds, done, total)}"
+    )
+
+
+def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
+    """Build a throttled progress callback for the Dask streaming path.
+
+    Logs:
+    - throttled progress lines (default every 15 s) with done/total, %,
+      elapsed and ETA — same format as the classic heartbeat but with
+      per-gpi granularity instead of per-job
+    - 25/50/75/100 % milestones
+    - per-worker memory diagnostic every 60 s (warns above 70 %)
+
+    The callback runs in the client (main) process; per-worker stdout is
+    not directly accessible without ``distributed.Worker.plugin`` plumbing,
+    so we query worker metrics via the scheduler every minute instead.
+    """
+    milestones = {0.25, 0.50, 0.75, 1.0}
+    logged_pct = set()
+    last_log = {"t": -float("inf")}
+    last_mem_check = {"t": -float("inf")}
+    started = time.monotonic()
+    mem_check_interval = 60.0  # seconds between worker memory queries
+
+    def _cb(done: int, total: int) -> None:
+        now = time.monotonic()
+        elapsed = now - started
+        pct = 100.0 * done / total if total else 0.0
+        throttled = (now - last_log["t"]) >= log_interval
+        milestone = False
+        for m in milestones:
+            if pct >= m * 100 and m not in logged_pct:
+                logged_pct.add(m)
+                milestone = True
+                break
+        if throttled or milestone or done >= total:
+            last_log["t"] = now
+            __logger.info(
+                "Dask progress: %s (validation %s)",
+                _format_progress(done, total, elapsed),
+                validation_run.id,
+            )
+
+        # Periodically check worker memory from the client side so that
+        # unmanaged-memory warnings appear in the log file.
+        if (now - last_mem_check["t"]) >= mem_check_interval:
+            last_mem_check["t"] = now
+            try:
+                from dask.distributed import get_client
+
+                client = get_client()
+                info = client.scheduler_info()
+                n_workers = len(info.get("workers", {}))
+                worker_lines = []
+                for addr, winfo in info.get("workers", {}).items():
+                    mem = winfo.get("metrics", {}).get("memory", {})
+                    process_mem = mem.get("process", 0)
+                    managed = mem.get("managed", 0)
+                    unmanaged = process_mem - managed if process_mem > managed else 0
+                    mem_limit = winfo.get("nbytes", 0)
+                    short = addr.split(":")[-1] if ":" in addr else addr
+                    if mem_limit and process_mem:
+                        frac = process_mem / mem_limit
+                        worker_lines.append(f"{short}={_fmt_bytes(process_mem)}/{_fmt_bytes(mem_limit)} ({frac:.0%})")
+                        if frac > 0.7:
+                            __logger.warning(
+                                "Dask worker %s memory usage high: %.0f%% "
+                                "(process=%s managed=%s unmanaged=%s limit=%s)",
+                                addr,
+                                frac * 100,
+                                _fmt_bytes(process_mem),
+                                _fmt_bytes(managed),
+                                _fmt_bytes(unmanaged),
+                                _fmt_bytes(mem_limit),
+                            )
+                    else:
+                        worker_lines.append(f"{short}={_fmt_bytes(process_mem)}")
+                if worker_lines:
+                    __logger.info(
+                        "Workers (%d): %s",
+                        n_workers,
+                        " | ".join(worker_lines),
+                    )
+            except Exception:
+                # Non-fatal: memory monitoring is diagnostic, not essential.
+                pass
+
+    return _cb
+
+
+def _fmt_bytes(n: int) -> str:
+    """Format byte count as human-readable string (e.g. '1.5 GiB')."""
+    if n <= 0:
+        return "0 B"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
+
+
+def _run_dask_validation(validation_run, val, jobs, run_dir, n_workers, ref_reader):
+    """
+    Run the whole validation through a single pytesmo ``Validation.calc`` call
+    using the Dask streaming path (pytesmo.parallel.DaskParallelExecutor).
+
+    All jobs are concatenated into one flat gpi/lon/lat (+ metadata) set and
+    processed in batches; each completed batch is converted and streamed to the
+    run netCDF so neither the client nor any Dask worker holds the full result
+    set in memory. GPU acceleration is enabled when ``settings.USE_GPU`` is
+    True; otherwise the metrics layer auto-dispatches to NumPy.
+
+    The ISMN reference reader is not fork-safe; the caller is responsible for
+    passing ``n_workers=1`` in that case.
+    """
+    all_gpis = np.concatenate([job[0] for job in jobs])
+    all_lons = np.concatenate([job[1] for job in jobs])
+    all_lats = np.concatenate([job[2] for job in jobs])
+
+    # ISMN jobs carry a 4th element: per-gpi metadata dicts; gridded jobs don't.
+    meta_list = []
+    for job in jobs:
+        if len(job) > 3:
+            meta_list.extend(job[3])
+        else:
+            meta_list.extend([{} for _ in range(len(job[0]))])
+
+    __logger.info(
+        "Running validation %s with Dask streaming path (%s gpis, %s workers, gpu=%s, reader=%s).",
+        validation_run.id,
+        len(all_gpis),
+        n_workers,
+        bool(getattr(settings, "USE_GPU", False)),
+        type(ref_reader).__name__ if ref_reader is not None else "?",
+    )
+
+    # Streaming accumulator: each completed batch is converted and appended to
+    # the run netCDF immediately, so neither the client nor the Dask worker ever
+    # holds the full result set in memory.
+    state = {"ok": 0, "error": 0, "key": None, "seen": False}
+
+    def _batch_cb(compact_results, n_gpis):
+        state["seen"] = True
+        if not compact_results:
+            state["error"] += n_gpis
+            return
+        converted = _pytesmo_to_qa4sm_results(compact_results)
+        check_and_store_results(str(validation_run.id), converted, run_dir)
+        ok_pts, error_pts = _count_job_status(converted, n_gpis)
+        state["ok"] += ok_pts
+        state["error"] += error_pts
+        if state["key"] is None and converted:
+            state["key"] = next(iter(converted))
+
+    progress_cb = _make_gpu_progress_callback(validation_run)
+    try:
+        summary = val.calc(
+            all_gpis,
+            all_lons,
+            all_lats,
+            meta_list,
+            rename_cols=False,
+            only_with_reference=True,
+            handle_errors="ignore",
+            use_gpu=bool(getattr(settings, "USE_GPU", False)),
+            parallel="dask",
+            n_workers=n_workers,
+            batch_size=settings.DASK_BATCH_SIZE,
+            output_format="zarr",
+            output_path=_dask_batch_cache_path(validation_run),
+            progress=True,
+            progress_callback=progress_cb,
+            batch_callback=_batch_cb,
+            max_read_retries=settings.MAX_READ_RETRIES,
+            retry_delay_seconds=settings.READ_RETRY_DELAY_SECONDS,
+            parallel_kwargs={
+                "dashboard": False,
+                "memory_limit": _dask_memory_limit(n_workers),
+                "memory_target_fraction": 0.6,
+                "memory_spill_fraction": 0.5,
+                "memory_terminate_fraction": 0.92,
+                # use_gpu=True makes DaskParallelExecutor probe CuPy at cluster
+                # start to size the worker pool to the GPU count. When
+                # settings.USE_GPU is False (the default on non-CUDA boxes)
+                # we skip the probe entirely — otherwise CuPy's
+                # cudaErrorInsufficientDriver aborts cluster startup.
+                "use_gpu": bool(getattr(settings, "USE_GPU", False)),
+                # Resilience knobs (defaults: 3 / 3 / 3).
+                "retries": settings.DASK_BATCH_RETRIES,
+                "max_job_retries": settings.MAX_READ_RETRIES,
+                "retry_delay_seconds": settings.READ_RETRY_DELAY_SECONDS,
+                "cache_load_retries": settings.CACHE_LOAD_RETRIES,
+            },
+        )
+    except Exception as e:
+        # A failure after every gpi has already been computed and streamed to the
+        # output netCDF (e.g. a Dask cluster-teardown timeout) must not trigger
+        # the classic-path fallback, which would discard the finished results.
+        processed = state["ok"] + state["error"]
+        if state["seen"] and processed == len(all_gpis):
+            __logger.warning(
+                "Dask validation %s already processed all %d gpis before %s during "
+                "teardown; treating the run as successful.",
+                validation_run.id,
+                processed,
+                type(e).__name__,
+            )
+            summary = {"n_gpis": processed, "batches": 0, "keys": []}
+        else:
+            raise
+    if not summary or summary.get("n_gpis", 0) == 0:
+        __logger.warning(f"Dask validation {validation_run.id} produced no results.")
+        raise RuntimeError("Dask path produced no results; falling back to the classic path.")
+
+    validation_run.ok_points += state["ok"]
+    validation_run.error_points += state["error"]
+    validation_run.progress = round(
+        (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
+    )
+    # _post_process_run only needs the result keys; hand it a dict whose keys are
+    # the qa4sm combination key (mirrors what the classic path passes).
+    _post_process_run(validation_run, run_dir, {state["key"]: None})
+
+
+# Backward-compatible alias for any external caller still using the old name.
+_run_gpu_dask_validation = _run_dask_validation
+
+
+def _run_classic_validation(validation_run, jobs, run_dir, max_workers):
+    """Run the classic ThreadPoolExecutor job loop (per-job validation).
+
+    When ``settings.THREAD_TIMEOUT_SECONDS > 0`` a job that does not finish
+    within that window is logged, counted as error, and resubmitted (the hung
+    thread keeps running in the background; Python cannot kill it).
+    ``settings.THREAD_TIMEOUT_SECONDS == 0`` (default) preserves the original
+    10 s polling behaviour.
+    """
+    validation_aborted = False
+    __logger.info(f"Running validation {validation_run.id} with {max_workers} parallel workers.")
+    total_jobs = len(jobs)
+    run_started_at = time.monotonic()
+    last_heartbeat_at = run_started_at
+    heartbeat_interval = getattr(settings, "HEARTBEAT_INTERVAL_SECONDS", 60)
+    thread_timeout = getattr(settings, "THREAD_TIMEOUT_SECONDS", 0.0)
+    poll_seconds = thread_timeout if thread_timeout > 0 else 10.0
+
+    # Coalesce netCDF writes to reduce open/append/close cycles against an
+    # increasingly large output file. Each entry is a (job_id, results,
+    # save_path) tuple; the queue is drained either when it reaches
+    # flush_threshold entries or when the run ends / aborts.
+    write_queue: list = []
+    flush_threshold = 10
+
+    def _flush():
+        _flush_results_queue(write_queue)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task_id = {}
+        job_table = {}
+        last_results = None
+        submitted = 0  # how many jobs have been submitted so far
+
+        def _submit_next():
+            nonlocal submitted
+            if submitted >= total_jobs:
+                return None
+            j = jobs[submitted]
+            task_id = uuid.uuid4().hex
+            future = executor.submit(execute_job, validation_run, j, task_id)
+            future_to_task_id[future] = task_id
+            job_table[task_id] = j
+            track_validation_task(validation_run, task_id)
+            submitted += 1
+            return future
+
+        # Prime the executor with up to max_workers initial jobs.
+        for _ in range(min(max_workers, total_jobs)):
+            f = _submit_next()
+            if f is None:
+                break
+
+        pending = set(future_to_task_id.keys())
+        try:
             while pending:
-                done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
+                done, pending = wait(pending, timeout=poll_seconds, return_when=FIRST_COMPLETED)
 
                 now = time.monotonic()
                 if now - last_heartbeat_at >= heartbeat_interval:
                     completed_jobs = total_jobs - len(pending)
-                    elapsed_seconds = int(now - run_started_at)
+                    elapsed_seconds = now - run_started_at
                     __logger.info(
-                        "Heartbeat validation %s: elapsed=%ss progress=%s%% jobs_completed=%s/%s pending=%s",
+                        "Heartbeat validation %s: %s jobs ok=%s error=%s",
                         validation_run.id,
-                        elapsed_seconds,
-                        validation_run.progress,
-                        completed_jobs,
-                        total_jobs,
-                        len(pending),
+                        _format_progress(
+                            completed_jobs,
+                            total_jobs,
+                            elapsed_seconds,
+                            unit="jobs",
+                        ),
+                        validation_run.ok_points,
+                        validation_run.error_points,
                     )
                     last_heartbeat_at = now
 
-                # no completed task in this interval; continue polling to allow cancellation checks
-                if not done:
-                    if any(
-                        validation_task_cancelled(future_to_task_id[f]) for f in pending
-                    ):
-                        validation_aborted = True
-                        __logger.debug(
-                            "Validation {} got cancelled while waiting for running jobs.".format(
-                                validation_run.id
-                            )
+                # Handle timed-out jobs: every pending future is past the
+                # poll window without any future completing. Resubmit each so
+                # the run keeps making progress; the hung thread continues in
+                # the background and is GC'd when it finally returns.
+                if not done and pending and thread_timeout > 0:
+                    for future in list(pending):
+                        task_id = future_to_task_id.get(future)
+                        if task_id is None:
+                            continue
+                        __logger.warning(
+                            "Job %s exceeded thread timeout %.1fs; resubmitting and "
+                            "continuing (previous thread continues in background).",
+                            task_id,
+                            thread_timeout,
                         )
+                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                        pending.discard(future)
+                        future_to_task_id.pop(future, None)
+                        untrack_validation_task(task_id)
+                        new_future = _submit_next()
+                        if new_future is not None:
+                            pending.add(new_future)
+                    continue
+
+                if not done:
+                    if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
+                        validation_aborted = True
+                        __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
                     continue
 
                 for future in done:
@@ -793,143 +1264,102 @@ def run_validation(validation_run:ValidationRun):
                         if validation_task_cancelled(task_id):
                             validation_aborted = True
 
-                        results = None if validation_aborted else future.result()
-
-                        # in case there where no points with overlapping data within
-                        # the validation period, results is an empty dictionary, and we
-                        # count this job as error
-                        if validation_aborted or not results:
-                            validation_run.error_points += num_gpis_from_job(
-                                job_table[task_id]
-                            )
+                        if validation_aborted:
+                            validation_run.error_points += num_gpis_from_job(job_table[task_id])
                         else:
-                            results = _pytesmo_to_qa4sm_results(results)
-                            check_and_store_results(task_id, results, run_dir)
-
-                            # If the job ran successfully, we have to check the status
-                            # attribute to see if the job actually calculated something
-                            # (ok) or had an error.
-                            # In principle we might have different result status for
-                            # different dataset combinations, because it might happen
-                            # that in one case the validation fails because there is
-                            # not enough data. For "ok_points" we only count the points
-                            # where all validations fail.
-
-                            result_key = list(results.keys())[0]  # there is only 1 key
-                            res = results[result_key]
-                            status_result_keys = list(
-                                filter(
-                                    lambda s: (
-                                        "status" in s and not s.split("|")[0].isdigit()
-                                    ),
-                                    res.keys(),
+                            res = _process_job_result(task_id, future, job_table, validation_run, run_dir, write=False)
+                            if res is not None:
+                                last_results = res
+                                # Queue the netCDF write; drain when threshold hit.
+                                _enqueue_or_flush_results(
+                                    task_id,
+                                    res,
+                                    run_dir,
+                                    write_queue,
+                                    flush_threshold=flush_threshold,
                                 )
-                            )
-                            ok = res[status_result_keys[0]] == 0
-                            for statkey in status_result_keys[1:]:
-                                ok = ok & (res[statkey] == 0)
-                            ngpis = num_gpis_from_job(
-                                job_table[task_id]
-                            )  # ? so we need a new criterion to determine, if the job was ok or not? like ngpis * len(time slices)
-                            nok = sum(ok)
-                            validation_run.ok_points += nok
-                            validation_run.error_points += ngpis - nok
 
                     except Exception as e:
-                        validation_run.error_points += num_gpis_from_job(
-                            job_table[task_id]
-                        )
-                        __logger.exception(
-                            "Parallel job execution failed. Job ID: {} Error: {}".format(
-                                task_id, e
-                            )
+                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                        __logger.error(
+                            "Job %s failed after all retries (%s: %s).",
+                            task_id,
+                            type(e).__name__,
+                            str(e)[:120],
                         )
                         if validation_task_cancelled(task_id):
                             validation_aborted = True
                     finally:
                         if not validation_task_cancelled(task_id):
                             untrack_validation_task(task_id)
+                        future_to_task_id.pop(future, None)
+
+                    # Replace the slot with the next pending job.
+                    new_future = _submit_next()
+                    if new_future is not None:
+                        pending.add(new_future)
 
                     if not validation_aborted:
                         validation_run.progress = round(
-                            (
-                                (validation_run.ok_points + validation_run.error_points)
-                                / validation_run.total_points
-                            )
-                            * 100
+                            (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
                         )
                     else:
                         validation_run.progress = -1
-                    __logger.info(
-                        "Dealt with task {}, validation {} is {} % done...".format(
-                            task_id, validation_run.id, validation_run.progress
-                        )
-                    )
+        finally:
+            _flush()
 
-        # once all tasks are finished:
-        # only store parameters and produce graphs if validation wasn't cancelled and
-        # we have metrics for at least one gpi - otherwise no netcdf output file
+    if not validation_aborted and last_results is not None:
+        _post_process_run(validation_run, run_dir, last_results)
 
-        if not validation_aborted:
-            set_outfile(validation_run, run_dir)
 
-            iam_dict = define_tsw_metrics(validation_run, get_period(validation_run))
-            temp_sub_wdw_instance = iam_dict["temp_sub_wdw_instance"]
-            temp_sub_wdws = iam_dict["temp_sub_wdws"]
+def run_validation(validation_run: ValidationRun):
+    __logger.info(f"Starting validation: {validation_run.id}")
 
-            transcriber = Pytesmo2Qa4smResultsTranscriber(
-                pytesmo_results=os.path.join(
-                    OUTPUT_FOLDER, validation_run.output_file
-                ),
-                intra_annual_slices=temp_sub_wdw_instance,
-                keep_pytesmo_ncfile=False,
-            )
-            if transcriber.exists:
-                restructured_results = transcriber.get_transcribed_dataset()
-                outname, outname_zarr = transcriber.build_outname(
-                    run_dir, results.keys()
-                )
-                transcriber.output_file_name = str(outname)
-                transcriber.output_zarr_name = str(outname_zarr)
-                transcriber.write_to_netcdf(transcriber.output_file_name)
+    try:
+        run_dir = os.path.join(OUTPUT_FOLDER, str(validation_run.id))
+        mkdir_if_not_exists(run_dir)
+        _clear_stale_outputs(run_dir)
 
-                save_validation_config(validation_run)
-
-                transcriber.compress(
-                    path=transcriber.output_file_name, compression="zlib", complevel=9
-                )
-
-                if temp_sub_wdws is None:
-                    temporal_sub_windows_names = [DEFAULT_TSW]
-                else:
-                    temporal_sub_windows_names = temp_sub_wdw_instance.names
-
-                __logger.info(
-                    f"temporal_sub_windows_names: {temporal_sub_windows_names}"
-                )
-
-                generate_all_graphs(
-                    validation_run=validation_run,
-                    outfolder=run_dir,
-                    temporal_sub_windows=temporal_sub_windows_names,
-                    save_metadata=validation_run.plots_save_metadata,
-                )
-
-    except Exception as e:
-        __logger.exception(
-            "Unexpected exception during validation {}:".format(validation_run)
+        ref_reader, read_name, read_kwargs = _get_spatial_reference_reader(validation_run)
+        total_points, jobs = create_jobs(
+            validation_run=validation_run,
+            reader=ref_reader,
+            dataset_config=validation_run.spatial_reference_configuration,
         )
+        validation_run.total_points = total_points
+        __logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
+
+        if _dask_requested():
+            n_workers = _determine_max_workers(jobs, ref_reader)
+            val = create_pytesmo_validation(validation_run, read_bulk=False)
+            try:
+                _run_dask_validation(validation_run, val, jobs, run_dir, n_workers, ref_reader)
+            except Exception as e:
+                __logger.warning(
+                    "Dask path failed (%s: %s). Falling back to the classic threaded path.",
+                    type(e).__name__,
+                    str(e)[:120],
+                )
+                validation_run.ok_points = 0
+                validation_run.error_points = 0
+                _clear_stale_outputs(run_dir)
+                max_workers = _determine_max_workers(jobs, ref_reader)
+                _run_classic_validation(validation_run, jobs, run_dir, max_workers)
+        else:
+            max_workers = _determine_max_workers(jobs, ref_reader)
+            _run_classic_validation(validation_run, jobs, run_dir, max_workers)
+
+    except Exception:
+        __logger.exception(f"Unexpected exception during validation {validation_run}:")
 
     finally:
         validation_run.end_time = datetime.now(tzlocal())
         __logger.info(
-            "Validation finished: {}. Jobs: {}, Errors: {}, OK: {}, End time: {} ".format(
-                validation_run,
-                validation_run.total_points,
-                validation_run.error_points,
-                validation_run.ok_points,
-                validation_run.end_time,
-            )
+            f"Validation finished: {validation_run}. "
+            f"Jobs: {validation_run.total_points}, "
+            f"Errors: {validation_run.error_points}, "
+            f"OK: {validation_run.ok_points}, "
+            f"End time: {validation_run.end_time}"
         )
 
     return validation_run
@@ -976,16 +1406,8 @@ def _pytesmo_to_qa4sm_results(results: dict) -> dict:
             else:
                 datasets = list(map(lambda t: t[0], key))
                 if metric[0] == "(" and metric[-1] == ")":
-                    metric = ast.literal_eval(
-                        metric
-                    )  # casts the string representing a tuple to a real tuple
+                    metric = ast.literal_eval(metric)  # casts the string representing a tuple to a real tuple
                 if isinstance(metric, tuple):
-                    # happens only for triple collocation metrics, where the
-                    # metric key is a tuple of (metric, dataset)
-                    # if metric[1].startswith("0-"):
-                    #     # triple collocation metrics for the reference should
-                    #     # not show up in the results
-                    #     continue
                     new_metric = "_".join(metric)
                 else:
                     new_metric = metric
@@ -998,7 +1420,7 @@ def _pytesmo_to_qa4sm_results(results: dict) -> dict:
     return qa4sm_res
 
 
-def get_period(val_run: ValidationRun) -> Union[None, List[str]]:
+def get_period(val_run: ValidationRun) -> None | list[str]:
     """
     Extract the validation period from the validation run object.
 
@@ -1010,10 +1432,12 @@ def get_period(val_run: ValidationRun) -> Union[None, List[str]]:
     Returns
     -------
     Union[None, List[str]]
-        The validation period as a list of two strings, the start and end date, respectively. If no period is defined, None is returned.
+        The validation period as a list of two strings, the start and end date,
+        respectively. If no period is defined, None is returned.
     """
     if val_run.interval_from is not None and val_run.interval_to is not None:
-        # while pytesmo can't deal with timezones, normalise the validation period to utc; can be removed once pytesmo can do timezones
+        # while pytesmo can't deal with timezones, normalise the validation
+        # period to utc; can be removed once pytesmo can do timezones
         startdate = val_run.interval_from.astimezone(UTC).replace(tzinfo=None)
         enddate = val_run.interval_to.astimezone(UTC).replace(tzinfo=None)
         return [startdate, enddate]
@@ -1021,10 +1445,11 @@ def get_period(val_run: ValidationRun) -> Union[None, List[str]]:
 
 
 def define_tsw_metrics(
-    val_run: ValidationRun, period: List
-) -> Dict[str, Union[TemporalSubWindowsCreator, Dict[str, TsDistributor], None]]:
+    val_run: ValidationRun, period: list
+) -> dict[str, TemporalSubWindowsCreator | dict[str, TsDistributor] | None]:
     """
-    Extract the temporal sub-window metrics settings from the validation run and instantiate the corresponding objects.
+    Extract the temporal sub-window metrics settings from the validation run
+    and instantiate the corresponding objects.
 
     Parameters
     ----------
@@ -1036,7 +1461,8 @@ def define_tsw_metrics(
     Returns
     -------
     Dict[str, Union[TemporalSubWindowsCreator, Dict[str, TsDistributor], None]]
-        A dictionary containing the temporal sub-window instance and the custom temporal sub-windows, if applicable. Otherwise, filled with None.
+        A dictionary containing the temporal sub-window instance and the custom
+        temporal sub-windows, if applicable. Otherwise, filled with None.
     """
     temp_sub_wdw_instance = None
 
@@ -1061,11 +1487,7 @@ def define_tsw_metrics(
             custom_subwindows=TEMPORAL_SUB_WINDOWS.get("custom", None),
         )
 
-    temp_sub_wdws = (
-        temp_sub_wdw_instance.custom_temporal_sub_windows
-        if temp_sub_wdw_instance
-        else None
-    )
+    temp_sub_wdws = temp_sub_wdw_instance.custom_temporal_sub_windows if temp_sub_wdw_instance else None
 
     __logger.debug(f"{temp_sub_wdw_instance=}")
     __logger.debug(f"{temp_sub_wdws=}")

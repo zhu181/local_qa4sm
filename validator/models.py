@@ -1,15 +1,14 @@
-
-from dataclasses import dataclass, field
-from datetime import datetime
 import threading
-from typing import ClassVar, Optional, Union
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import ClassVar, Optional
 
 
 @dataclass
 class DatasetConfiguration:
     # validator.models.validation_run.ValidationRun
     id: int
-    validation: "ValidationRun"
+    validation: "ValidationRun" = field(repr=False)
     dataset: "Dataset"
     version: "DatasetVersion"
     variable: "DataVariable"
@@ -36,8 +35,8 @@ class DataVariable:
     help_text: str
     unit: str = "n.a."
 
-    min_value: Optional[float] = None
-    max_value: Optional[float] = None
+    min_value: float | None = None
+    max_value: float | None = None
     display_name: str = "n.a."
 
     # many-to-one relationships coming from other models:
@@ -49,10 +48,11 @@ class DataVariable:
 
 @dataclass
 class ParametrisedFilter:
-    id: int
-    dataset_config: "DatasetConfiguration"
-    filter: "DataFilter"
-    parameters: str
+    id: int = 0
+    dataset_config: Optional["DatasetConfiguration"] = field(default=None, repr=False)
+    filter: Optional["DataFilter"] = None
+    parameters: str = ""
+
 
 @dataclass
 class DataFilter:
@@ -61,18 +61,18 @@ class DataFilter:
     description: str
     help_text: str
     parameterised: bool = False
-    dialog_name: Optional[str] = None
+    dialog_name: str | None = None
     default_set_active: bool = False
-    default_parameter: Optional[str] = None
-    to_include: Optional[str] = None
-    to_exclude: Optional[str] = None
+    default_parameter: str | None = None
+    to_include: str | None = None
+    to_exclude: str | None = None
     readonly: bool = False
 
     # many-to-one relationships coming from other models:
     # dataset_configuration from DatasetConfiguration
 
     def __str__(self):
-        return "{} ({})".format(self.name, self.description)
+        return f"{self.name} ({self.description})"
 
 
 @dataclass
@@ -81,9 +81,9 @@ class DatasetVersion:
     short_name: str
     pretty_name: str
     help_text: str
-    time_range_start: Optional[str] = None
-    time_range_end: Optional[str] = None
-    geographical_range: Optional[dict] = None
+    time_range_start: str | None = None
+    time_range_end: str | None = None
+    geographical_range: dict | None = None
     filters: list = field(default_factory=list)
     variables: list = field(default_factory=list)
 
@@ -109,7 +109,7 @@ class Dataset:
     versions: list = field(default_factory=list)
 
     resolution = None
-    reader: Optional[str] = None
+    reader: str | None = None
     # many-to-one relationships coming from other models:
     # dataset_configuration from DatasetConfiguration
 
@@ -183,33 +183,33 @@ class ValidationRun:
     # temporal matching window size:
     TEMP_MATCH_WINDOW = 12
 
-    id: Union[str, int]
+    id: str | int
     name_tag: str
     total_points: int = 0
     error_points: int = 0
     ok_points: int = 0
 
-    spatial_reference_configuration: Optional[DatasetConfiguration] = None
-    temporal_reference_configuration: Optional[DatasetConfiguration] = None
-    scaling_ref: Optional[DatasetConfiguration] = None
+    spatial_reference_configuration: DatasetConfiguration | None = None
+    temporal_reference_configuration: DatasetConfiguration | None = None
+    scaling_ref: DatasetConfiguration | None = None
 
     scaling_method: str = NO_SCALING
-    interval_from: Optional[datetime] = None
-    interval_to: Optional[datetime] = None
+    interval_from: datetime | None = None
+    interval_to: datetime | None = None
     anomalies: str = NO_ANOM
-    min_lat: Optional[float] = None
-    min_lon: Optional[float] = None
-    max_lat: Optional[float] = None
-    max_lon: Optional[float] = None
+    min_lat: float | None = None
+    min_lon: float | None = None
+    max_lat: float | None = None
+    max_lon: float | None = None
 
     # only applicable if anomalies with climatology is selected
-    anomalies_from: Optional[datetime] = None
-    anomalies_to: Optional[datetime] = None
+    anomalies_from: datetime | None = None
+    anomalies_to: datetime | None = None
     # upscaling of ISMN point measurements
     upscaling_method: str = NO_UPSCALE
     temporal_stability: bool = False
 
-    output_file: Optional[str] = None
+    output_file: str | None = None
 
     tcol: bool = False
     bootstrap_tcol_cis: bool = False
@@ -228,15 +228,15 @@ class ValidationRun:
     #     ),
 
     intra_annual_metrics: bool = False
-    intra_annual_type: Optional[str] = None
-    intra_annual_overlap: Optional[int] = None
+    intra_annual_type: str | None = None
+    intra_annual_overlap: int | None = None
 
     stability_metrics: bool = False
 
     dataset_configurations: list[DatasetConfiguration] = field(default_factory=list)
 
 
-class ValidationTaskDoesNotExist(Exception):
+class ValidationTaskDoesNotExistError(Exception):
     pass
 
 
@@ -249,14 +249,10 @@ class _ValidationTaskQuerySet:
 
 
 class ValidationTaskManager:
-    def _resolve_task_id(
-        self, task_id: Optional[str] = None, **kwargs
-    ) -> Optional[str]:
+    def _resolve_task_id(self, task_id: str | None = None, **kwargs) -> str | None:
         return task_id or kwargs.get("task_id")
 
-    def filter(
-        self, task_id: Optional[str] = None, **kwargs
-    ) -> _ValidationTaskQuerySet:
+    def filter(self, task_id: str | None = None, **kwargs) -> _ValidationTaskQuerySet:
         resolved_task_id = self._resolve_task_id(task_id=task_id, **kwargs)
         if resolved_task_id is None:
             return _ValidationTaskQuerySet([])
@@ -264,24 +260,22 @@ class ValidationTaskManager:
             task = ValidationTask._store.get(resolved_task_id)
         return _ValidationTaskQuerySet([task] if task else [])
 
-    def get(self, task_id: Optional[str] = None, **kwargs) -> "ValidationTask":
+    def get(self, task_id: str | None = None, **kwargs) -> "ValidationTask":
         resolved_task_id = self._resolve_task_id(task_id=task_id, **kwargs)
         if resolved_task_id is None:
             raise ValidationTask.DoesNotExist("task_id is required")
         with ValidationTask._lock:
             task = ValidationTask._store.get(resolved_task_id)
         if task is None:
-            raise ValidationTask.DoesNotExist(
-                f"ValidationTask with task_id={resolved_task_id} does not exist"
-            )
+            raise ValidationTask.DoesNotExist(f"ValidationTask with task_id={resolved_task_id} does not exist")
         return task
 
 
 @dataclass
 class ValidationTask:
-    validation: Optional[ValidationRun] = None
-    task_id: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    validation: ValidationRun | None = None
+    task_id: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     _store: ClassVar[dict[str, "ValidationTask"]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
@@ -299,5 +293,5 @@ class ValidationTask:
             ValidationTask._store.pop(self.task_id, None)
 
 
-ValidationTask.DoesNotExist = ValidationTaskDoesNotExist
+ValidationTask.DoesNotExist = ValidationTaskDoesNotExistError
 ValidationTask.objects = ValidationTaskManager()

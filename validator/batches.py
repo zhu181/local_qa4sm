@@ -1,15 +1,14 @@
-import numpy as np
-import pandas as pd
-from typing import Union
 import logging
 
+import numpy as np
+import pandas as pd
 from ismn.interface import ISMN_Interface
 from pygeobase.io_base import GriddedBase
+from smap_io.interface import ReaderWithExtension_SMAP
 
 from validator import globals
 from validator.models import DatasetConfiguration, ValidationRun
 from validator.readers import ReaderWithTsExtension
-from smap_io.interface import ReaderWithExtension_SMAP
 
 __logger = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ def get_depths_params(param_filters):
     return [depth_from, depth_to]
 
 
-def get_meta_filter_dict(filters) -> Union[dict, None]:
+def get_meta_filter_dict(filters) -> dict | None:
     """
     Convert sensor / station metadata based filters to dict used by the ISMN
     Interface if any of the relevant filters are activated.
@@ -56,12 +55,7 @@ def get_meta_filter_dict(filters) -> Union[dict, None]:
 # very basic geographic subsetting with only a bounding box. simple should
 # also be quick :-)
 def _geographic_subsetting(gpis, lons, lats, min_lat, min_lon, max_lat, max_lon):
-    if (
-        min_lat is not None
-        and min_lon is not None
-        and max_lat is not None
-        and max_lon is not None
-    ):
+    if min_lat is not None and min_lon is not None and max_lat is not None and max_lon is not None:
         # shift back to "normal" coordinates if shifted to the right
         if min_lon > 180.0:
             shift = round(min_lon / 360.0) * 360.0
@@ -84,27 +78,12 @@ def _geographic_subsetting(gpis, lons, lats, min_lat, min_lon, max_lat, max_lon)
                 new_max_lon = max_lon
 
             index = np.nonzero(
-                (
-                    (lats <= max_lat)
-                    & (lats >= min_lat)
-                    & (lons <= 180.0)
-                    & (lons >= new_min_lon)
-                )
-                | (
-                    (lats <= max_lat)
-                    & (lats >= min_lat)
-                    & (lons <= new_max_lon)
-                    & (lons >= -180.0)
-                )
+                ((lats <= max_lat) & (lats >= min_lat) & (lons <= 180.0) & (lons >= new_min_lon))
+                | ((lats <= max_lat) & (lats >= min_lat) & (lons <= new_max_lon) & (lons >= -180.0))
             )
         # handle "normal" case of bounding box not across antimeridian
         else:
-            index = np.nonzero(
-                (lats <= max_lat)
-                & (lats >= min_lat)
-                & (lons <= max_lon)
-                & (lons >= min_lon)
-            )
+            index = np.nonzero((lats <= max_lat) & (lats >= min_lat) & (lons <= max_lon) & (lons >= min_lon))
 
         gpis = gpis[index]
         lats = lats[index]
@@ -122,7 +101,7 @@ def create_jobs(
     reader,
     dataset_config: DatasetConfiguration,
     return_points=True,
-) -> Union[tuple, list]:
+) -> tuple | list:
     """
     Create jobs for validation run. The reference reader is passed here.
 
@@ -146,9 +125,7 @@ def create_jobs(
         n of validation points
     """
     if dataset_config is None:
-        raise ValueError(
-            "A dataset configuration has not been provided for the jobs generation"
-        )
+        raise ValueError("A dataset configuration has not been provided for the jobs generation")
 
     total_points = 0
 
@@ -222,9 +199,7 @@ def create_jobs(
                 reshaped[key] = meta_value
             # parse information on the measuring depth from the instument
             # metadata
-            reshaped[globals.MEASURE_DEPTH_FROM] = metadata[globals.INSTRUMENT_META][0][
-                1
-            ]
+            reshaped[globals.MEASURE_DEPTH_FROM] = metadata[globals.INSTRUMENT_META][0][1]
             reshaped[globals.MEASURE_DEPTH_TO] = metadata[globals.INSTRUMENT_META][0][2]
 
             return reshaped
@@ -258,11 +233,7 @@ def create_jobs(
                 total_points += len(gpis)
 
     else:
-        raise ValueError(
-            "Don't know how to get gridpoints and generate jobs for reader {}".format(
-                reader
-            )
-        )
+        raise ValueError(f"Don't know how to get gridpoints and generate jobs for reader {reader}")
 
     if not return_points:
         return jobs
@@ -270,7 +241,7 @@ def create_jobs(
     return total_points, jobs
 
 
-def create_upscaling_lut(validation_run:ValidationRun, datasets, spatial_ref_name) -> dict:
+def create_upscaling_lut(validation_run: ValidationRun, datasets, spatial_ref_name) -> dict:
     """
     Create a lookup table that aggregates the non-reference measurement
     points falling under the same reference
@@ -324,9 +295,7 @@ def create_upscaling_lut(validation_run:ValidationRun, datasets, spatial_ref_nam
             if not other_points_jobs:
                 __logger.debug(
                     "There are no points to average in the selected dataset "
-                    "of {}. Check the filtering configuration".format(
-                        other_config.dataset
-                    )
+                    f"of {other_config.dataset}. Check the filtering configuration"
                 )
                 # make sure there is always a key, even when no points are
                 # found
