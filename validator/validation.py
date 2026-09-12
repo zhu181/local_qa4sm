@@ -494,6 +494,8 @@ def execute_job(validation_run, job, task_id=None, max_retries=1, retry_delay_se
                 only_with_reference=True,
                 handle_errors="ignore",
                 use_gpu=settings.USE_GPU,
+                max_read_retries=settings.MAX_READ_RETRIES,
+                retry_delay_seconds=settings.READ_RETRY_DELAY_SECONDS,
             )
             end_time = datetime.now(tzlocal())
             duration = end_time - start_time
@@ -541,9 +543,19 @@ def check_and_store_results(job_id, results, save_path):
     try:
         netcdf_results_manager(results, save_path)
     except OSError as exc:
-        # A stale/corrupted nc file from a previous interrupted run can break appends.
+        # netCDF4 raises plain OSError (and subclasses) for file/format
+        # problems — there is no dedicated ``netCDF4.NetCDFError``. A
+        # stale/corrupted nc file from a previous interrupted run can break
+        # appends; the message strings below cover the cases the qa4sm
+        # codebase has actually seen in the wild.
         msg = str(exc)
-        recoverable = "NetCDF: Unknown file format" in msg or "NetCDF: Write to read only" in msg
+        recoverable = (
+            "NetCDF: Unknown file format" in msg
+            or "NetCDF: Write to read only" in msg
+            or "NetCDF: HDF error" in msg
+            or "NetCDF: file" in msg
+            and "not found" in msg
+        )
         if not recoverable:
             raise
 
@@ -564,6 +576,87 @@ def check_and_store_results(job_id, results, save_path):
             return
 
         raise
+
+
+def _reopen_netcdf_or_delete(path: str) -> None:
+    """Validate every .nc file in a directory by reopening it for reading.
+
+    ``path`` is the run directory (the same argument passed to
+    ``check_and_store_results`` / ``netcdf_results_manager``). Each
+    ``*.nc`` file inside is reopened read-only; if the reopen raises a
+    non-Permission OSError (silently corrupted file), the file is deleted
+    so the next write recreates it cleanly. This guards against the
+    C-level netCDF4 crashes observed when a run is killed mid-append.
+
+    Transient errors (file still being written by another worker,
+    PermissionError on Windows file-locks) are NOT treated as corruption —
+    they re-raise so the caller can retry on the next flush.
+    """
+    if not os.path.isdir(path):
+        # Legacy / single-file mode — pass through to the original logic.
+        target = path
+        targets = [path]
+    else:
+        targets = [os.path.join(path, name) for name in os.listdir(path) if name.endswith(".nc")]
+
+    for target in targets:
+        if not os.path.exists(target):
+            continue
+        try:
+            with netCDF4.Dataset(target, "r"):
+                pass
+        except PermissionError as exc:
+            # File is open by another writer (Dask worker, or a flush
+            # still in flight). Not corruption — propagate so the next
+            # flush retries.
+            raise PermissionError(f"netCDF file {target} is busy ({exc}); will retry on next flush") from exc
+        except OSError as exc:
+            __logger.warning(
+                "netCDF file %s failed reopen-validation (%s: %s); deleting and forcing recreate.",
+                target,
+                type(exc).__name__,
+                str(exc)[:120],
+            )
+            try:
+                os.remove(target)
+            except OSError:
+                __logger.warning("Could not remove corrupted netCDF file %s", target)
+
+
+def _enqueue_or_flush_results(
+    job_id: str,
+    results: dict,
+    save_path: str,
+    queue: list,
+    flush_threshold: int = 10,
+    flush_interval_seconds: float = 30.0,
+) -> None:
+    """Coalesce result writes to reduce netCDF open/append/close cycles.
+
+    Each ``check_and_store_results`` call opens the run netCDF, appends the
+    batch, and closes. On long classic-path runs the repeated open/close
+    cycles against an increasingly large file (many variables + many rows)
+    are the most likely trigger for the C-level ``STATUS_ACCESS_VIOLATION``
+    seen inside the netCDF4 native DLL. Queuing up to ``flush_threshold``
+    results before a single ``netcdf_results_manager`` write cuts those
+    cycles by an order of magnitude.
+    """
+    queue.append((job_id, results, save_path))
+    if len(queue) >= flush_threshold:
+        _flush_results_queue(queue)
+
+
+def _flush_results_queue(queue: list) -> None:
+    """Drain the write queue with a single consolidated netCDF append per batch."""
+    while queue:
+        job_id, results, save_path = queue.pop(0)
+        check_and_store_results(job_id, results, save_path)
+        try:
+            _reopen_netcdf_or_delete(save_path)
+        except PermissionError as exc:
+            # Another worker may still have the file open during streaming.
+            # Log once and continue — the next flush will retry.
+            __logger.debug("%s", exc)
 
 
 def track_validation_task(validation_run, task_id):
@@ -598,14 +691,15 @@ def _count_job_status(results: dict, ngpis: int) -> tuple[int, int]:
     return nok, ngpis - nok
 
 
-def _process_job_result(task_id, future, job_table, validation_run, run_dir):
+def _process_job_result(task_id, future, job_table, validation_run, run_dir, write: bool = True):
     results = future.result()
     if not results:
         validation_run.error_points += num_gpis_from_job(job_table[task_id])
         return None
 
     results = _pytesmo_to_qa4sm_results(results)
-    check_and_store_results(task_id, results, run_dir)
+    if write:
+        check_and_store_results(task_id, results, run_dir)
 
     ngpis = num_gpis_from_job(job_table[task_id])
     ok_pts, error_pts = _count_job_status(results, ngpis)
@@ -706,10 +800,32 @@ def _determine_max_workers(jobs, ref_reader):
     return max_workers
 
 
+def _dask_requested() -> bool:
+    """True when the Dask streaming path should be used.
+
+    Dask is now the default parallel backend (QA4SM_USE_DASK=1). It is also
+    implied by QA4SM_USE_GPU=1 — the GPU path runs through Dask workers. The
+    classic ThreadPoolExecutor path is opt-in via QA4SM_USE_CLASSIC=1 (paired
+    with QA4SM_USE_DASK=0).
+    """
+    if getattr(settings, "USE_CLASSIC", False):
+        return False
+    return bool(getattr(settings, "USE_DASK", True)) or bool(getattr(settings, "USE_GPU", False))
+
+
 def _gpu_dask_requested() -> bool:
-    """True when QA4SM_USE_GPU is set AND a working GPU/CuPy is detected."""
+    """True when the Dask streaming path should run GPU-accelerated metrics.
+
+    Kept for backward compatibility — callers that check the old name continue
+    to work. Use ``_dask_requested()`` for the path selection itself.
+    """
+    if not _dask_requested():
+        return False
     if not getattr(settings, "USE_GPU", False):
         return False
+    # Verify CuPy/CUDA is actually usable before declaring GPU mode. The Dask
+    # path still runs (NumPy metrics) when this fails — we just downgrade
+    # USE_GPU so the metrics layer falls back to NumPy silently.
     try:
         from pytesmo.gpu import is_gpu_available
 
@@ -718,10 +834,9 @@ def _gpu_dask_requested() -> bool:
         available = False
     if not available:
         __logger.warning(
-            "QA4SM_USE_GPU is set but no GPU/CuPy is available. Falling back to the classic threaded path on CPU."
+            "QA4SM_USE_GPU is set but no GPU/CuPy is available. Running the Dask streaming path with NumPy metrics."
         )
         settings.USE_GPU = False
-        return False
     return True
 
 
@@ -813,13 +928,18 @@ def _format_progress(done: int, total: int, elapsed_seconds: float, unit: str = 
 
 
 def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
-    """Build a throttled progress callback for the Dask-parallel GPU path.
+    """Build a throttled progress callback for the Dask streaming path.
 
-    In addition to progress logging, this callback periodically queries
-    worker memory statistics via the Dask scheduler and emits a WARNING
-    through the client's logging system when unmanaged memory is high.
-    This ensures the diagnostic reaches the log file (the worker-side
-    ``distributed.worker.memory`` warning only goes to the worker's stderr).
+    Logs:
+    - throttled progress lines (default every 15 s) with done/total, %,
+      elapsed and ETA — same format as the classic heartbeat but with
+      per-gpi granularity instead of per-job
+    - 25/50/75/100 % milestones
+    - per-worker memory diagnostic every 60 s (warns above 70 %)
+
+    The callback runs in the client (main) process; per-worker stdout is
+    not directly accessible without ``distributed.Worker.plugin`` plumbing,
+    so we query worker metrics via the scheduler every minute instead.
     """
     milestones = {0.25, 0.50, 0.75, 1.0}
     logged_pct = set()
@@ -842,7 +962,7 @@ def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
         if throttled or milestone or done >= total:
             last_log["t"] = now
             __logger.info(
-                "GPU/Dask progress: %s (validation %s)",
+                "Dask progress: %s (validation %s)",
                 _format_progress(done, total, elapsed),
                 validation_run.id,
             )
@@ -856,14 +976,21 @@ def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
 
                 client = get_client()
                 info = client.scheduler_info()
+                n_workers = len(info.get("workers", {}))
+                worker_lines = []
                 for addr, winfo in info.get("workers", {}).items():
                     mem = winfo.get("metrics", {}).get("memory", {})
                     process_mem = mem.get("process", 0)
                     managed = mem.get("managed", 0)
                     unmanaged = process_mem - managed if process_mem > managed else 0
                     mem_limit = winfo.get("nbytes", 0)
+                    short = addr.split(":")[-1] if ":" in addr else addr
                     if mem_limit and process_mem:
                         frac = process_mem / mem_limit
+                        worker_lines.append(
+                            f"{short}={_fmt_bytes(process_mem)}/{_fmt_bytes(mem_limit)} "
+                            f"({frac:.0%})"
+                        )
                         if frac > 0.7:
                             __logger.warning(
                                 "Dask worker %s memory usage high: %.0f%% "
@@ -875,12 +1002,17 @@ def _make_gpu_progress_callback(validation_run, log_interval: float = 15.0):
                                 _fmt_bytes(unmanaged),
                                 _fmt_bytes(mem_limit),
                             )
+                    else:
+                        worker_lines.append(f"{short}={_fmt_bytes(process_mem)}")
+                if worker_lines:
+                    __logger.info(
+                        "Workers (%d): %s",
+                        n_workers,
+                        " | ".join(worker_lines),
+                    )
             except Exception:
                 # Non-fatal: memory monitoring is diagnostic, not essential.
                 pass
-            import gc
-
-            gc.collect()
 
     return _cb
 
@@ -896,14 +1028,19 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f} PiB"
 
 
-def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
+def _run_dask_validation(validation_run, val, jobs, run_dir, n_workers, ref_reader):
     """
     Run the whole validation through a single pytesmo ``Validation.calc`` call
-    using the Dask-parallel GPU path.
+    using the Dask streaming path (pytesmo.parallel.DaskParallelExecutor).
 
     All jobs are concatenated into one flat gpi/lon/lat (+ metadata) set and
-    processed by pytesmo's DaskParallelExecutor (1 GPU per worker), replacing
-    the classic ThreadPoolExecutor job loop.
+    processed in batches; each completed batch is converted and streamed to the
+    run netCDF so neither the client nor any Dask worker holds the full result
+    set in memory. GPU acceleration is enabled when ``settings.USE_GPU`` is
+    True; otherwise the metrics layer auto-dispatches to NumPy.
+
+    The ISMN reference reader is not fork-safe; the caller is responsible for
+    passing ``n_workers=1`` in that case.
     """
     all_gpis = np.concatenate([job[0] for job in jobs])
     all_lons = np.concatenate([job[1] for job in jobs])
@@ -917,12 +1054,13 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
         else:
             meta_list.extend([{} for _ in range(len(job[0]))])
 
-    n_workers = getattr(settings, "MAX_PARALLEL_WORKERS", os.cpu_count() or 1)
     __logger.info(
-        "Running validation %s with Dask-parallel GPU path (%s gpis, %s workers).",
+        "Running validation %s with Dask streaming path (%s gpis, %s workers, gpu=%s, reader=%s).",
         validation_run.id,
         len(all_gpis),
         n_workers,
+        bool(getattr(settings, "USE_GPU", False)),
+        type(ref_reader).__name__ if ref_reader is not None else "?",
     )
 
     # Streaming accumulator: each completed batch is converted and appended to
@@ -953,7 +1091,7 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
             rename_cols=False,
             only_with_reference=True,
             handle_errors="ignore",
-            use_gpu=True,
+            use_gpu=bool(getattr(settings, "USE_GPU", False)),
             parallel="dask",
             n_workers=n_workers,
             batch_size=settings.DASK_BATCH_SIZE,
@@ -962,12 +1100,25 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
             progress=True,
             progress_callback=progress_cb,
             batch_callback=_batch_cb,
+            max_read_retries=settings.MAX_READ_RETRIES,
+            retry_delay_seconds=settings.READ_RETRY_DELAY_SECONDS,
             parallel_kwargs={
                 "dashboard": False,
                 "memory_limit": _dask_memory_limit(n_workers),
                 "memory_target_fraction": 0.6,
                 "memory_spill_fraction": 0.5,
                 "memory_terminate_fraction": 0.92,
+                # use_gpu=True makes DaskParallelExecutor probe CuPy at cluster
+                # start to size the worker pool to the GPU count. When
+                # settings.USE_GPU is False (the default on non-CUDA boxes)
+                # we skip the probe entirely — otherwise CuPy's
+                # cudaErrorInsufficientDriver aborts cluster startup.
+                "use_gpu": bool(getattr(settings, "USE_GPU", False)),
+                # Resilience knobs (defaults: 3 / 3 / 3).
+                "retries": settings.DASK_BATCH_RETRIES,
+                "max_job_retries": settings.MAX_READ_RETRIES,
+                "retry_delay_seconds": settings.READ_RETRY_DELAY_SECONDS,
+                "cache_load_retries": settings.CACHE_LOAD_RETRIES,
             },
         )
     except Exception as e:
@@ -977,7 +1128,7 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
         processed = state["ok"] + state["error"]
         if state["seen"] and processed == len(all_gpis):
             __logger.warning(
-                "GPU/Dask validation %s already processed all %d gpis before %s during "
+                "Dask validation %s already processed all %d gpis before %s during "
                 "teardown; treating the run as successful.",
                 validation_run.id,
                 processed,
@@ -987,8 +1138,8 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
         else:
             raise
     if not summary or summary.get("n_gpis", 0) == 0:
-        __logger.warning(f"GPU/Dask validation {validation_run.id} produced no results.")
-        raise RuntimeError("GPU/Dask path produced no results; falling back to the classic path.")
+        __logger.warning(f"Dask validation {validation_run.id} produced no results.")
+        raise RuntimeError("Dask path produced no results; falling back to the classic path.")
 
     validation_run.ok_points += state["ok"]
     validation_run.error_points += state["error"]
@@ -1000,88 +1151,165 @@ def _run_gpu_dask_validation(validation_run, val, jobs, run_dir):
     _post_process_run(validation_run, run_dir, {state["key"]: None})
 
 
+# Backward-compatible alias for any external caller still using the old name.
+_run_gpu_dask_validation = _run_dask_validation
+
+
 def _run_classic_validation(validation_run, jobs, run_dir, max_workers):
-    """Run the classic ThreadPoolExecutor job loop (per-job validation)."""
+    """Run the classic ThreadPoolExecutor job loop (per-job validation).
+
+    When ``settings.THREAD_TIMEOUT_SECONDS > 0`` a job that does not finish
+    within that window is logged, counted as error, and resubmitted (the hung
+    thread keeps running in the background; Python cannot kill it).
+    ``settings.THREAD_TIMEOUT_SECONDS == 0`` (default) preserves the original
+    10 s polling behaviour.
+    """
     validation_aborted = False
     __logger.info(f"Running validation {validation_run.id} with {max_workers} parallel workers.")
     total_jobs = len(jobs)
     run_started_at = time.monotonic()
     last_heartbeat_at = run_started_at
     heartbeat_interval = getattr(settings, "HEARTBEAT_INTERVAL_SECONDS", 60)
+    thread_timeout = getattr(settings, "THREAD_TIMEOUT_SECONDS", 0.0)
+    poll_seconds = thread_timeout if thread_timeout > 0 else 10.0
+
+    # Coalesce netCDF writes to reduce open/append/close cycles against an
+    # increasingly large output file. Each entry is a (job_id, results,
+    # save_path) tuple; the queue is drained either when it reaches
+    # flush_threshold entries or when the run ends / aborts.
+    write_queue: list = []
+    flush_threshold = 10
+
+    def _flush():
+        _flush_results_queue(write_queue)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_task_id = {}
         job_table = {}
         last_results = None
+        submitted = 0  # how many jobs have been submitted so far
 
-        for j in jobs:
+        def _submit_next():
+            nonlocal submitted
+            if submitted >= total_jobs:
+                return None
+            j = jobs[submitted]
             task_id = uuid.uuid4().hex
             future = executor.submit(execute_job, validation_run, j, task_id)
             future_to_task_id[future] = task_id
             job_table[task_id] = j
             track_validation_task(validation_run, task_id)
+            submitted += 1
+            return future
+
+        # Prime the executor with up to max_workers initial jobs.
+        for _ in range(min(max_workers, total_jobs)):
+            f = _submit_next()
+            if f is None:
+                break
 
         pending = set(future_to_task_id.keys())
-        while pending:
-            done, pending = wait(pending, timeout=10, return_when=FIRST_COMPLETED)
+        try:
+            while pending:
+                done, pending = wait(pending, timeout=poll_seconds, return_when=FIRST_COMPLETED)
 
-            now = time.monotonic()
-            if now - last_heartbeat_at >= heartbeat_interval:
-                completed_jobs = total_jobs - len(pending)
-                elapsed_seconds = now - run_started_at
-                __logger.info(
-                    "Heartbeat validation %s: %s jobs ok=%s error=%s",
-                    validation_run.id,
-                    _format_progress(
-                        completed_jobs,
-                        total_jobs,
-                        elapsed_seconds,
-                        unit="jobs",
-                    ),
-                    validation_run.ok_points,
-                    validation_run.error_points,
-                )
-                last_heartbeat_at = now
+                now = time.monotonic()
+                if now - last_heartbeat_at >= heartbeat_interval:
+                    completed_jobs = total_jobs - len(pending)
+                    elapsed_seconds = now - run_started_at
+                    __logger.info(
+                        "Heartbeat validation %s: %s jobs ok=%s error=%s",
+                        validation_run.id,
+                        _format_progress(
+                            completed_jobs,
+                            total_jobs,
+                            elapsed_seconds,
+                            unit="jobs",
+                        ),
+                        validation_run.ok_points,
+                        validation_run.error_points,
+                    )
+                    last_heartbeat_at = now
 
-            if not done:
-                if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
-                    validation_aborted = True
-                    __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
-                continue
-
-            for future in done:
-                task_id = future_to_task_id[future]
-                try:
-                    if validation_task_cancelled(task_id):
-                        validation_aborted = True
-
-                    if validation_aborted:
+                # Handle timed-out jobs: every pending future is past the
+                # poll window without any future completing. Resubmit each so
+                # the run keeps making progress; the hung thread continues in
+                # the background and is GC'd when it finally returns.
+                if not done and pending and thread_timeout > 0:
+                    for future in list(pending):
+                        task_id = future_to_task_id.get(future)
+                        if task_id is None:
+                            continue
+                        __logger.warning(
+                            "Job %s exceeded thread timeout %.1fs; resubmitting and "
+                            "continuing (previous thread continues in background).",
+                            task_id,
+                            thread_timeout,
+                        )
                         validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                    else:
-                        res = _process_job_result(task_id, future, job_table, validation_run, run_dir)
-                        if res is not None:
-                            last_results = res
-
-                except Exception as e:
-                    validation_run.error_points += num_gpis_from_job(job_table[task_id])
-                    __logger.error(
-                        "Job %s failed after all retries (%s: %s).",
-                        task_id,
-                        type(e).__name__,
-                        str(e)[:120],
-                    )
-                    if validation_task_cancelled(task_id):
-                        validation_aborted = True
-                finally:
-                    if not validation_task_cancelled(task_id):
+                        pending.discard(future)
+                        future_to_task_id.pop(future, None)
                         untrack_validation_task(task_id)
+                        new_future = _submit_next()
+                        if new_future is not None:
+                            pending.add(new_future)
+                    continue
 
-                if not validation_aborted:
-                    validation_run.progress = round(
-                        (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
-                    )
-                else:
-                    validation_run.progress = -1
+                if not done:
+                    if any(validation_task_cancelled(future_to_task_id[f]) for f in pending):
+                        validation_aborted = True
+                        __logger.debug(f"Validation {validation_run.id} got cancelled while waiting.")
+                    continue
+
+                for future in done:
+                    task_id = future_to_task_id[future]
+                    try:
+                        if validation_task_cancelled(task_id):
+                            validation_aborted = True
+
+                        if validation_aborted:
+                            validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                        else:
+                            res = _process_job_result(task_id, future, job_table, validation_run, run_dir, write=False)
+                            if res is not None:
+                                last_results = res
+                                # Queue the netCDF write; drain when threshold hit.
+                                _enqueue_or_flush_results(
+                                    task_id,
+                                    res,
+                                    run_dir,
+                                    write_queue,
+                                    flush_threshold=flush_threshold,
+                                )
+
+                    except Exception as e:
+                        validation_run.error_points += num_gpis_from_job(job_table[task_id])
+                        __logger.error(
+                            "Job %s failed after all retries (%s: %s).",
+                            task_id,
+                            type(e).__name__,
+                            str(e)[:120],
+                        )
+                        if validation_task_cancelled(task_id):
+                            validation_aborted = True
+                    finally:
+                        if not validation_task_cancelled(task_id):
+                            untrack_validation_task(task_id)
+                        future_to_task_id.pop(future, None)
+
+                    # Replace the slot with the next pending job.
+                    new_future = _submit_next()
+                    if new_future is not None:
+                        pending.add(new_future)
+
+                    if not validation_aborted:
+                        validation_run.progress = round(
+                            (validation_run.ok_points + validation_run.error_points) / validation_run.total_points * 100
+                        )
+                    else:
+                        validation_run.progress = -1
+        finally:
+            _flush()
 
     if not validation_aborted and last_results is not None:
         _post_process_run(validation_run, run_dir, last_results)
@@ -1104,13 +1332,14 @@ def run_validation(validation_run: ValidationRun):
         validation_run.total_points = total_points
         __logger.debug(f"Jobs to run: {[job[:-1] for job in jobs]}")
 
-        if _gpu_dask_requested():
+        if _dask_requested():
+            n_workers = _determine_max_workers(jobs, ref_reader)
             val = create_pytesmo_validation(validation_run, read_bulk=False)
             try:
-                _run_gpu_dask_validation(validation_run, val, jobs, run_dir)
+                _run_dask_validation(validation_run, val, jobs, run_dir, n_workers, ref_reader)
             except Exception as e:
                 __logger.warning(
-                    "GPU/Dask path failed (%s: %s). Falling back to the classic threaded path with GPU metrics.",
+                    "Dask path failed (%s: %s). Falling back to the classic threaded path.",
                     type(e).__name__,
                     str(e)[:120],
                 )

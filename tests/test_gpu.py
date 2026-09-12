@@ -9,10 +9,24 @@ from validator import settings, validation
 
 
 @pytest.fixture(autouse=True)
-def _reset_use_gpu():
+def _reset_parallel_flags():
+    """Restore the parallel-backend flags around each test.
+
+    The autouse fixture intentionally resets USE_GPU/USE_DASK/USE_CLASSIC
+    because tests below set them to exercise different code paths; without
+    the reset, env-var leakage from one test would corrupt the next.
+    """
+    saved = {
+        "USE_GPU": settings.USE_GPU,
+        "USE_DASK": settings.USE_DASK,
+        "USE_CLASSIC": settings.USE_CLASSIC,
+    }
     settings.USE_GPU = False
+    settings.USE_DASK = True
+    settings.USE_CLASSIC = False
     yield
-    settings.USE_GPU = False
+    for key, val in saved.items():
+        setattr(settings, key, val)
 
 
 class _RecordingVal:
@@ -41,7 +55,8 @@ def _jobs():
     ]
 
 
-def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkeypatch):
+def test_run_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkeypatch):
+    settings.USE_GPU = True  # exercise the GPU flag passthrough
     monkeypatch.setattr(validation, "_pytesmo_to_qa4sm_results", lambda r: r)
     monkeypatch.setattr(validation, "_count_job_status", lambda r, n: (2, 1))
     stored = {}
@@ -51,7 +66,7 @@ def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkey
 
     val_run = types.SimpleNamespace(id="run1", ok_points=0, error_points=0, progress=0, total_points=3)
     fake = _RecordingVal()
-    validation._run_gpu_dask_validation(val_run, fake, _jobs(), "/tmp/run")
+    validation._run_dask_validation(val_run, fake, _jobs(), "/tmp/run", n_workers=2, ref_reader=None)
 
     assert fake.calls["gpis"] == [1, 2, 3]
     assert fake.calls["meta"] == [{}, {}, {"network": "n1"}]
@@ -75,7 +90,22 @@ def test_run_gpu_dask_validation_concatenates_jobs_and_dispatches_to_dask(monkey
     assert posted["a"][2] == {("a", "sm"): None}
 
 
-def test_run_gpu_dask_validation_raises_on_empty_results(monkeypatch):
+def test_run_dask_validation_uses_settings_use_gpu(monkeypatch):
+    """use_gpu passed to val.calc must follow settings.USE_GPU so the Dask
+    path works on non-CUDA boxes (where USE_GPU stays False)."""
+    settings.USE_GPU = False
+    monkeypatch.setattr(validation, "_pytesmo_to_qa4sm_results", lambda r: r)
+    monkeypatch.setattr(validation, "_count_job_status", lambda r, n: (2, 1))
+    monkeypatch.setattr(validation, "check_and_store_results", lambda *a, **k: None)
+    monkeypatch.setattr(validation, "_post_process_run", lambda *a, **k: None)
+
+    val_run = types.SimpleNamespace(id="run-g-off", ok_points=0, error_points=0, progress=0, total_points=3)
+    fake = _RecordingVal()
+    validation._run_dask_validation(val_run, fake, _jobs(), "/tmp/run", n_workers=2, ref_reader=None)
+    assert fake.calls["kwargs"]["use_gpu"] is False
+
+
+def test_run_dask_validation_raises_on_empty_results(monkeypatch):
     class EmptyVal:
         def calc(self, *args, **kwargs):
             return {}
@@ -84,7 +114,7 @@ def test_run_gpu_dask_validation_raises_on_empty_results(monkeypatch):
     monkeypatch.setattr(validation, "_pytesmo_to_qa4sm_results", not_called)
     val_run = types.SimpleNamespace(id="run2", ok_points=0, error_points=0, progress=0, total_points=3)
     with pytest.raises(RuntimeError, match="produced no results"):
-        validation._run_gpu_dask_validation(val_run, EmptyVal(), _jobs(), "/tmp/run")
+        validation._run_dask_validation(val_run, EmptyVal(), _jobs(), "/tmp/run", n_workers=2, ref_reader=None)
     not_called.assert_not_called()
     assert val_run.ok_points == 0
 
@@ -196,10 +226,15 @@ def test_gpu_dask_requested_disabled_when_setting_off(monkeypatch):
     assert validation._gpu_dask_requested() is False
 
 
-def test_gpu_dask_requested_falls_back_when_gpu_unavailable(monkeypatch):
+def test_gpu_dask_requested_downgrades_when_gpu_unavailable(monkeypatch):
+    """When USE_GPU=1 but CuPy/CUDA is missing, _gpu_dask_requested still
+    returns True (so the Dask path runs) but silently downgrades USE_GPU so
+    the metrics layer falls back to NumPy. Previously the helper returned
+    False and the validator fell back to the classic threaded path; that
+    fallback no longer happens — see ``_dask_requested``."""
     monkeypatch.setattr(settings, "USE_GPU", True)
     monkeypatch.setattr("pytesmo.gpu.is_gpu_available", lambda: False)
-    assert validation._gpu_dask_requested() is False
+    assert validation._gpu_dask_requested() is True
     assert settings.USE_GPU is False
 
 
@@ -208,6 +243,38 @@ def test_gpu_dask_requested_enabled_when_gpu_available(monkeypatch):
     monkeypatch.setattr("pytesmo.gpu.is_gpu_available", lambda: True)
     assert validation._gpu_dask_requested() is True
     assert settings.USE_GPU is True
+
+
+def test_dask_requested_default_true(monkeypatch):
+    monkeypatch.setattr(settings, "USE_DASK", True)
+    monkeypatch.setattr(settings, "USE_GPU", False)
+    monkeypatch.setattr(settings, "USE_CLASSIC", False)
+    assert validation._dask_requested() is True
+
+
+def test_dask_requested_implied_by_gpu(monkeypatch):
+    monkeypatch.setattr(settings, "USE_DASK", False)
+    monkeypatch.setattr(settings, "USE_GPU", True)
+    monkeypatch.setattr(settings, "USE_CLASSIC", False)
+    assert validation._dask_requested() is True
+
+
+def test_dask_requested_disabled_when_classic(monkeypatch):
+    monkeypatch.setattr(settings, "USE_DASK", True)
+    monkeypatch.setattr(settings, "USE_GPU", True)
+    monkeypatch.setattr(settings, "USE_CLASSIC", True)
+    assert validation._dask_requested() is False
+
+
+def test_dask_requested_disabled_when_both_off(monkeypatch):
+    monkeypatch.setattr(settings, "USE_DASK", False)
+    monkeypatch.setattr(settings, "USE_GPU", False)
+    monkeypatch.setattr(settings, "USE_CLASSIC", False)
+    # Default behaviour: USE_DASK is True at module import, so reaching the
+    # both-off state requires explicit env vars. In that case we fall back to
+    # classic (the same default the classic-only builds had before Dask
+    # became the default).
+    assert validation._dask_requested() is False
 
 
 def test_dask_memory_limit_uses_env_override(monkeypatch):
@@ -269,6 +336,68 @@ def test_dask_memory_limit_divides_total_budget(monkeypatch):
     monkeypatch.setattr(settings, "DASK_MEMORY_LIMIT", "16GB")
     limit = validation._dask_memory_limit(n_workers=2)
     assert limit == parse_bytes("16GB") // 2
+
+
+def test_max_read_retries_uses_env_override(monkeypatch):
+    monkeypatch.setenv("QA4SM_MAX_READ_RETRIES", "5")
+    assert settings._parse_max_read_retries() == 5
+
+
+def test_max_read_retries_defaults_to_three(monkeypatch):
+    monkeypatch.delenv("QA4SM_MAX_READ_RETRIES", raising=False)
+    assert settings._parse_max_read_retries() == 3
+
+
+def test_max_read_retries_floors_at_zero(monkeypatch):
+    monkeypatch.setenv("QA4SM_MAX_READ_RETRIES", "-1")
+    assert settings._parse_max_read_retries() == 0
+    monkeypatch.setenv("QA4SM_MAX_READ_RETRIES", "abc")
+    assert settings._parse_max_read_retries() == 3
+
+
+def test_retry_delay_seconds_uses_env_override(monkeypatch):
+    monkeypatch.setenv("QA4SM_READ_RETRY_DELAY_SECONDS", "2.5")
+    assert settings._parse_retry_delay_seconds() == 2.5
+
+
+def test_retry_delay_seconds_floors_at_zero(monkeypatch):
+    monkeypatch.setenv("QA4SM_READ_RETRY_DELAY_SECONDS", "-0.1")
+    assert settings._parse_retry_delay_seconds() == 0.0
+
+
+def test_dask_batch_retries_uses_env_override(monkeypatch):
+    monkeypatch.setenv("QA4SM_DASK_BATCH_RETRIES", "5")
+    assert settings._parse_dask_batch_retries() == 5
+
+
+def test_dask_batch_retries_defaults_to_three(monkeypatch):
+    monkeypatch.delenv("QA4SM_DASK_BATCH_RETRIES", raising=False)
+    assert settings._parse_dask_batch_retries() == 3
+
+
+def test_thread_timeout_seconds_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("QA4SM_THREAD_TIMEOUT_SECONDS", raising=False)
+    assert settings._parse_thread_timeout_seconds() == 0.0
+
+
+def test_thread_timeout_seconds_uses_env_override(monkeypatch):
+    monkeypatch.setenv("QA4SM_THREAD_TIMEOUT_SECONDS", "600")
+    assert settings._parse_thread_timeout_seconds() == 600.0
+
+
+def test_cache_load_retries_uses_env_override(monkeypatch):
+    monkeypatch.setenv("QA4SM_CACHE_LOAD_RETRIES", "7")
+    assert settings._parse_cache_load_retries() == 7
+
+
+def test_cache_load_retries_defaults_to_three(monkeypatch):
+    monkeypatch.delenv("QA4SM_CACHE_LOAD_RETRIES", raising=False)
+    assert settings._parse_cache_load_retries() == 3
+
+
+def test_cache_load_retries_floors_at_one(monkeypatch):
+    monkeypatch.setenv("QA4SM_CACHE_LOAD_RETRIES", "0")
+    assert settings._parse_cache_load_retries() == 1
 
 
 def test_format_duration():
@@ -404,7 +533,7 @@ def test_gpu_progress_callback_throttles_and_reports_milestones(monkeypatch, cap
         tick["t"] = 30.0
         cb(50, 100)  # 50% milestone
 
-    messages = [r.message for r in caplog.records if r.message.startswith("GPU/Dask progress")]
+    messages = [r.message for r in caplog.records if r.message.startswith("Dask progress")]
     assert len(messages) == 3
     assert "1/100" in messages[0]
     assert "25/100" in messages[1]

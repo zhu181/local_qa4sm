@@ -38,18 +38,40 @@ def _install_termination_signal_handlers() -> None:
 
 
 def _install_warning_suppression() -> None:
+    """Suppress the highly-repetitive per-gpi warnings emitted by pytesmo.
+
+    The pytesmo validation framework emits one warning per gpi for cases like
+    "Not enough observations to calculate metrics." or "No data for dataset".
+    On a 9km SMAP×NSMCSMC bbox run this produces hundreds of thousands of
+    lines that drown the actual progress information.
+
+    Two layers are used: a ``warnings.filterwarnings`` rule to silence the
+    warning categories at the source, and a ``showwarning`` override so any
+    warning that does get through the filters is still dropped instead of
+    printing to stderr (bypassing the logging pipeline).
+    """
+    # Silenced warning-message prefixes. Match is substring-based.
+    silenced_prefixes = (
+        "Not enough observations to calculate metrics.",
+        "One or more sample arguments is too small",
+        "An input array is constant; the correlation coefficient is not defined.",
+        "No data for dataset",
+        "Sending large graph of size",  # dask
+    )
+
     def _showwarning(message, category, filename, lineno, file=None, line=None):
         msg = str(message)
-        if (
-            "Not enough observations to calculate metrics." in msg
-            or "One or more sample arguments is too small; all returned values will be NaN." in msg
-            or "An input array is constant; the correlation coefficient is not defined." in msg
-            or "No data for dataset" in msg
-        ):
+        if any(p in msg for p in silenced_prefixes):
             return
         return _ORIGINAL_SHOWWARNING(message, category, filename, lineno, file=file, line=line)
 
     warnings.showwarning = _showwarning
+
+    # Belt-and-braces: install filter rules at the source so pytesmo's
+    # warnings.warn(...) calls never reach the showwarning hook on most
+    # Python builds (some packages re-enter the warning pipeline).
+    for prefix in silenced_prefixes:
+        warnings.filterwarnings("ignore", message=f".*{prefix}.*")
 
 
 class _ValidationNoiseFilter(logging.Filter):
